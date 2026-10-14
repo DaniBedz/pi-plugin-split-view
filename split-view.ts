@@ -23,7 +23,8 @@
  * overlay; the band needs the layout engine and only works in fullscreen.
  *
  * Commands:
- *   /split              toggle the band (thinking+tools) on/off
+ *   /split              full toggle pair: OFF = all panels off (bare pi
+ *                       layout), ON = the panel flags saved as startup defaults
  *   /split-thinking     toggle the thinking panel within the band
  *   /split-tools        toggle the tools panel within the band
  *   /files              toggle the files panel (dock in fullscreen, overlay otherwise)
@@ -835,12 +836,14 @@ function requestRender(): void {
 
 const anyPanelActive = () =>
 	isLayoutLayerActive("ui") || isLayoutLayerActive("files") || !!REG.active;
-// SV-01: "band on" is derived from the band itself, NOT from the shared "ui"
-// layout layer — that layer is also installed for trimResponse/files, so it
-// must not be read as band state (a files-only or trim-only layout used to
-// make /split report "off" for an already-off band and refuse to turn it on).
-// The layer check stays in use only for layout ownership.
-const bandActive = () => thinkingOn || toolsOn;
+// SV-01 (revised): /split is a full toggle pair over every panel flag
+// (thinking/tools/files/trim), so its "on" state is the flag disjunction.
+// The old bandActive() derived state from the band alone, which made a
+// files-only or trim-only layout report "off" for a not-bare view and left
+// those panels running after a /split off. Layout-layer checks remain in use
+// only for layout ownership (anyPanelActive/filesActive).
+const panelsActive = () =>
+	thinkingOn || toolsOn || filesOn || trimResponse;
 const filesActive = () => isLayoutLayerActive("files") || !!REG.active;
 
 // ─── framed panel components ─────────────────────────────────────────────────
@@ -1894,7 +1897,8 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerCommand("split", {
-		description: "Toggle the thinking+tools band on/off",
+		description:
+			"Toggle all panels: off = bare pi layout, on = saved startup defaults",
 		handler: async (_args, ctx) => {
 			if (ctx.mode !== "tui") {
 				ctx.ui.notify("/split requires interactive mode", "error");
@@ -1904,17 +1908,34 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("/split requires fullscreen mode", "warning");
 				return;
 			}
-			const wasOn = bandActive();
+			// Full toggle pair (revised SV-01): OFF clears every panel flag so
+			// pi's native layout is fully restored (no band, no files dock, no
+			// trim/response-only swap). ON restores the panel flags saved as
+			// startup defaults (ui-panels.json, written by /split-save); if the
+			// saved layout has no panels on (or was never saved), fall back to
+			// the classic default of thinking + tools. Geometry (bandHeight,
+			// toolMode, toolsWidthPct) is session-local and not reset here.
+			const wasOn = panelsActive();
 			if (wasOn) {
 				thinkingOn = false;
 				toolsOn = false;
+				filesOn = false;
+				trimResponse = false;
 				reconcileLayout(ctx.ui.theme);
-				ctx.ui.notify("Split view off", "info");
+				ctx.ui.notify("Split view off (all panels)", "info");
 			} else {
-				thinkingOn = true;
-				toolsOn = true;
+				const cfg = normalizeConfig(loadUiPanelsConfig());
+				if (!cfg.thinking && !cfg.tools && !cfg.files && !cfg.trimResponse) {
+					thinkingOn = true;
+					toolsOn = true;
+				} else {
+					thinkingOn = cfg.thinking;
+					toolsOn = cfg.tools;
+					filesOn = cfg.files;
+					trimResponse = cfg.trimResponse;
+				}
 				reconcileLayout(ctx.ui.theme);
-				ctx.ui.notify("Split view on", "info");
+				ctx.ui.notify("Split view on (saved layout)", "info");
 			}
 		},
 	});

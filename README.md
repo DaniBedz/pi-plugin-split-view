@@ -42,8 +42,8 @@ transcript mode — composed as one clean layout layer over pi's native transcri
 ## Commands
 
 | Command | Effect |
-|---|---|
-| `/split` | toggle the top band (thinking + tools) |
+| --- | --- |
+| `/split` | full toggle pair: OFF = all panels off (bare pi layout), ON = the panel flags saved as startup defaults (falls back to thinking + tools if the saved layout has nothing on) |
 | `/split-thinking` | toggle the thinking panel within the band |
 | `/split-tools` | toggle the tool panel within the band |
 | `/split-tools-view` | compact ↔ full tool detail |
