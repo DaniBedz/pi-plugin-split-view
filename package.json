@@ -1,7 +1,10 @@
 {
 	"name": "pi-split-view",
-	"version": "1.0.4",
+	"version": "1.1.0",
 	"description": "Split-view TUI extension for the pi coding agent: thinking/tool band, files dock with edit-diff subpanel, response-only transcript mode",
+	"scripts": {
+		"typecheck": "tsc --noEmit"
+	},
 	"license": "MIT",
 	"repository": {
 		"type": "git",
@@ -20,6 +23,7 @@
 		"layout-manager.ts",
 		"ui-panels-config.ts",
 		"README.md",
+		"CHANGELOG.md",
 		"LICENSE",
 		"assets/screenshot-band-files.png",
 		"assets/gallery-preview.png"
@@ -31,7 +35,11 @@
 		"image": "https://raw.githubusercontent.com/Hugo-W/pi-split-view/main/assets/gallery-preview.png"
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": "*",
-		"@earendil-works/pi-tui": "*"
+		"@earendil-works/pi-coding-agent": ">=1.2.0",
+		"@earendil-works/pi-tui": ">=1.2.0"
+	},
+	"devDependencies": {
+		"@types/node": "^22.0.0",
+		"typescript": "^5.6.3"
 	}
 }

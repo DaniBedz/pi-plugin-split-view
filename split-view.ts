@@ -170,6 +170,13 @@ let termHeight = 0;
 let thinkingOn = true;
 let toolsOn = true;
 let filesOn = false;
+/** Files panel edit-diff subpanel (session-local; /split-diff, persisted by
+ * /split-save). Off keeps the file list but drops the bottom diff section. */
+let showDiff = true;
+/** Response-only divider between successive assistant messages: "rule" (dim
+ * dashed line) or "space" (plain blank line). Session-local; /split-divider,
+ * persisted by /split-save. */
+let answerDividerMode: "rule" | "space" = "rule";
 let toolMode: ToolModeCfg = "compact";
 /** Panel C: response-only view instead of pi's transcript (persisted). */
 let trimResponse = false;
@@ -387,6 +394,42 @@ function thinkingLines(theme: Theme, width: number): string[] {
 const responseDoc = new Container();
 let streamingResponseComponent: AssistantMessageComponent | null = null;
 
+/** Live theme proxy captured from ctx.ui.theme / the widget factory; it
+ * resolves the current global theme on every access, so answer dividers never
+ * go stale after a theme change (the doc is rebuilt on change anyway). */
+let docTheme: Theme | null = null;
+
+/** One dim rule separating consecutive assistant messages in the response-only
+ *  doc. Dashed (and dim) so it reads fainter than the panel borders. */
+class AnswerDivider implements Component {
+	render(width: number): string[] {
+		const rule = "┄".repeat(Math.max(0, width));
+		return [docTheme ? docTheme.fg("dim", rule) : rule];
+	}
+	invalidate(): void {}
+	dispose(): void {}
+}
+
+/** Role of the last message actually added to the response doc. */
+let lastResponseRole: "user" | "assistant" | null = null;
+
+/**
+ * Begin a response-doc entry: always a blank spacer between turns, plus the
+ * divider ONLY between two successive assistant messages (never around a user
+ * message). `answerDivider` = "space" drops the rule, leaving plain
+ * blank-line spacing.
+ */
+function beginResponseEntry(role: "user" | "assistant"): void {
+	if (responseDoc.children.length > 0) responseDoc.addChild(new Spacer(1));
+	if (
+		role === "assistant" &&
+		lastResponseRole === "assistant" &&
+		answerDividerMode === "rule"
+	)
+		responseDoc.addChild(new AnswerDivider());
+	lastResponseRole = role;
+}
+
 function messageText(msg: any): string {
 	const c = msg?.content;
 	if (typeof c === "string") return c;
@@ -411,7 +454,7 @@ function addResponseMessage(msg: any): void {
 		if (msg.role === "user") {
 			const text = messageText(msg);
 			if (!text.trim()) return;
-			if (responseDoc.children.length > 0) responseDoc.addChild(new Spacer(1));
+			beginResponseEntry("user");
 			responseDoc.addChild(new UserMessageComponent(text, getMarkdownTheme()));
 			return;
 		}
@@ -424,7 +467,7 @@ function addResponseMessage(msg: any): void {
 			// Keep empty-text messages whose stopReason shows an error marker.
 			if (!hasText && msg.stopReason !== "error" && msg.stopReason !== "aborted")
 				return;
-			if (responseDoc.children.length > 0) responseDoc.addChild(new Spacer(1));
+			beginResponseEntry("assistant");
 			// toolCalls are stripped too so the component's error/abort markers
 			// render (it suppresses them when toolCalls exist — in the full
 			// transcript the tool components show errors instead).
@@ -448,6 +491,7 @@ function addResponseMessage(msg: any): void {
 function rebuildResponseDoc(ctx: ExtensionContext): void {
 	responseDoc.clear();
 	streamingResponseComponent = null;
+	lastResponseRole = null;
 	const branch = ctx.sessionManager.getBranch();
 	for (const entry of branch) {
 		if (entry.type !== "message") continue;
@@ -468,7 +512,7 @@ function responseMessageUpdate(msg: any): void {
 		// spacers accumulate in the doc.
 		if (!hasVisible) return;
 		try {
-			if (responseDoc.children.length > 0) responseDoc.addChild(new Spacer(1));
+			beginResponseEntry("assistant");
 			streamingResponseComponent = new AssistantMessageComponent(
 				undefined as any,
 				true,
@@ -1021,7 +1065,7 @@ class FilesPanel {
 			this.heightProvider?.() || termHeight || recentEntries().length + 12;
 		// Cache key MUST include height: a height-only terminal resize changes
 		// the list/diff row split without bumping filesVersion or width.
-		const key = `${filesVersion}|${editDiff.version}|${width}|${height}`;
+		const key = `${filesVersion}|${editDiff.version}|${width}|${height}|${showDiff ? 1 : 0}`;
 		if (key === this.cacheKey) return this.cacheLines;
 
 		const th = this.theme;
@@ -1032,17 +1076,19 @@ class FilesPanel {
 			th.fg("border", "│") + pad(truncateToWidth(c, inner)) + th.fg("border", "│");
 
 		const entries = recentEntries();
-		// Reserve the bottom half for the edit diff (min 2 list rows).
+		// Reserve the bottom half for the edit diff (min 2 list rows) when the
+		// diff subpanel is shown; otherwise the list owns the whole panel.
 		const half = Math.max(6, Math.floor(height / 2));
-		const listRows = Math.max(2, half - 4);
+		const listRows = showDiff ? Math.max(2, half - 4) : Math.max(1, height - 4);
 		// SV-06: exact row accounting so the bottom border lands on the last
 		// allocated row. Fixed chrome is 6 rows (top, title, list separator,
 		// diff separator, diff title, bottom border) and the list always pads
 		// to listRows, so the diff section gets exactly what remains. Without
 		// this a short diff left an unframed hole between the panel and the
 		// viewport bottom (the old diffRows budget was never padded when a diff
-		// existed, only when it did not).
-		const diffRows = Math.max(0, height - listRows - 6);
+		// existed, only when it did not). When the diff subpanel is off the
+		// chrome is 4 rows (top, title, list separator, bottom border).
+		const diffRows = showDiff ? Math.max(0, height - listRows - 6) : 0;
 
 		const meta = (e: FileEntry) =>
 			th.fg("muted", `${e.ops}${e.count > 1 ? `×${e.count}` : ""}`);
@@ -1089,42 +1135,44 @@ class FilesPanel {
 		body.push(row(` ${th.fg("dim", LEGEND)}`));
 		while (body.length < listRows) body.push(row(""));
 
-		// ── edit-diff subpanel ──
+		// ── edit-diff subpanel (optional: /split-diff) ──
 		const diffBody: string[] = [];
-		diffBody.push(th.fg("border", `├${"─".repeat(inner)}┤`));
-		// SV-05: truncate the title by DISPLAY COLUMNS (wide/CJK/emoji paths)
-		// and compute the fill from the truncated title's visible width, so the
-		// title can never overrun the fill and collide with the right border.
-		// Budget: leading " ✎ " + trailing " " around the path text.
-		const title = editDiff.path
-			? th.fg("accent", ` ✎ ${truncateToWidth(displayPath(editDiff.path), inner - 4, "…")} `)
-			: th.fg("dim", " Last Edit ");
-		const titleFill = "─".repeat(
-			Math.max(0, inner - visibleWidth(title)),
-		);
-		diffBody.push(
-			th.fg("border", "│") +
-				title +
-				th.fg("border", titleFill) +
-				th.fg("border", "│"),
-		);
+		if (showDiff) {
+			diffBody.push(th.fg("border", `├${"─".repeat(inner)}┤`));
+			// SV-05: truncate the title by DISPLAY COLUMNS (wide/CJK/emoji paths)
+			// and compute the fill from the truncated title's visible width, so the
+			// title can never overrun the fill and collide with the right border.
+			// Budget: leading " ✎ " + trailing " " around the path text.
+			const title = editDiff.path
+				? th.fg("accent", ` ✎ ${truncateToWidth(displayPath(editDiff.path), inner - 4, "…")} `)
+				: th.fg("dim", " Last Edit ");
+			const titleFill = "─".repeat(
+				Math.max(0, inner - visibleWidth(title)),
+			);
+			diffBody.push(
+				th.fg("border", "│") +
+					title +
+					th.fg("border", titleFill) +
+					th.fg("border", "│"),
+			);
 
-		if (editDiff.diff) {
-			const rendered = renderDiff(editDiff.diff).split(/\r?\n/);
-			// SV-06: cap content one row below the pad target so the "… +N more"
-			// marker always fits; the section is then padded to diffRows so the
-			// frame closes on the last row.
-			const shown = rendered.slice(0, Math.max(0, diffRows - 1));
-			for (const l of shown) diffBody.push(row(` ${l}`));
-			if (rendered.length > shown.length && diffRows > 0)
-				diffBody.push(
-					row(` ${th.fg("dim", `… +${rendered.length - shown.length} more`)}`),
-				);
-			while (diffBody.length < diffRows + 2) diffBody.push(row(""));
-		} else {
-			if (diffRows > 0)
-				diffBody.push(row(` ${th.fg("dim", "No edit yet")}`));
-			while (diffBody.length < diffRows + 2) diffBody.push(row(""));
+			if (editDiff.diff) {
+				const rendered = renderDiff(editDiff.diff).split(/\r?\n/);
+				// SV-06: cap content one row below the pad target so the "… +N more"
+				// marker always fits; the section is then padded to diffRows so the
+				// frame closes on the last row.
+				const shown = rendered.slice(0, Math.max(0, diffRows - 1));
+				for (const l of shown) diffBody.push(row(` ${l}`));
+				if (rendered.length > shown.length && diffRows > 0)
+					diffBody.push(
+						row(` ${th.fg("dim", `… +${rendered.length - shown.length} more`)}`),
+					);
+				while (diffBody.length < diffRows + 2) diffBody.push(row(""));
+			} else {
+				if (diffRows > 0)
+					diffBody.push(row(` ${th.fg("dim", "No edit yet")}`));
+				while (diffBody.length < diffRows + 2) diffBody.push(row(""));
+			}
 		}
 
 		const out = [
@@ -1440,8 +1488,9 @@ export default function (pi: ExtensionAPI) {
 		widgetSet = true;
 		ctx.ui.setWidget(
 			WIDGET_KEY,
-			(tui) => {
+			(tui, theme) => {
 				tuiRef = tui;
+				docTheme = theme;
 				initLayoutManager(tui);
 				// SV-14: apply the still-pending startup composition here. The
 				// factory runs synchronously during session_start (before the
@@ -1450,7 +1499,7 @@ export default function (pi: ExtensionAPI) {
 				// startupTimer remains as the fallback for a later-ready root.
 				if (startupPending && REG.gen === MY_GEN) {
 					startupPending = false;
-					reconcileLayout(tui?.theme ?? ctx.ui.theme);
+					reconcileLayout(ctx.ui.theme);
 				}
 				return {
 					render: (width: number) => {
@@ -1460,7 +1509,7 @@ export default function (pi: ExtensionAPI) {
 						// capture ANSI at build time. Compare a color fingerprint and
 						// recompose with the live theme ONLY on a change — ordinary
 						// state changes never rebuild the tree.
-						const liveTheme = tuiRef?.theme ?? ctx.ui.theme;
+						const liveTheme = ctx.ui.theme;
 						const fp = themeFingerprint(liveTheme);
 						if (composedThemeFp === null) composedThemeFp = fp;
 						else if (fp !== composedThemeFp) {
@@ -1481,28 +1530,26 @@ export default function (pi: ExtensionAPI) {
 							isLayoutLayerActive("ui")
 						) {
 							const cols = tuiRef?.terminal?.columns ?? 120;
-							const want = Math.max(
-								34,
-								Math.min(48, Math.floor(cols * 0.25)),
-							);
+							const want = dockColsFor(cols);
 							if (want !== composedDockCols)
-								reconcileLayout(tuiRef?.theme ?? ctx.ui.theme);
+								reconcileLayout(ctx.ui.theme);
 						}
-							// F2: same recompose hook for the band's explicit width split,
-							// keyed on the TERMINAL width — any resize recomposes, even
-							// when the tools cols round to the same value (101→102 at 50%).
-							if (
-								thinkingOn &&
-								toolsOn &&
-								typeof tuiRef?.setLayoutRoot === "function" &&
-								isLayoutLayerActive("ui")
-							) {
-								const cols = tuiRef?.terminal?.columns ?? 120;
-								if (cols !== composedBandTermCols)
-									reconcileLayout(tuiRef?.theme ?? ctx.ui.theme);
-							}
+						// F2: same recompose hook for the band's explicit width split,
+						// keyed on the TERMINAL width — any resize recomposes, even
+						// when the tools cols round to the same value (101→102 at 50%).
+						if (
+							thinkingOn &&
+							toolsOn &&
+							typeof tuiRef?.setLayoutRoot === "function" &&
+							isLayoutLayerActive("ui")
+						) {
+							const cols = tuiRef?.terminal?.columns ?? 120;
+							if (cols !== composedBandTermCols)
+								reconcileLayout(ctx.ui.theme);
+						}
 						return widgetLines(liveTheme, width);
 					},
+					invalidate: () => {},
 				};
 			},
 			{ placement: "belowEditor" },
@@ -1593,6 +1640,8 @@ export default function (pi: ExtensionAPI) {
 		bandHeight = cfg.bandHeight;
 		toolsWidthPct = cfg.toolsWidthPct;
 		filesOn = cfg.files;
+		showDiff = cfg.diff;
+		answerDividerMode = cfg.answerDivider;
 		trimResponse = cfg.trimResponse;
 		// SV-14: arm the startup composition BEFORE reconstruct — the widget
 		// factory runs synchronously inside it and is the first point where the
@@ -1735,7 +1784,8 @@ export default function (pi: ExtensionAPI) {
 					editGeneration === 1 &&
 					editGenByCallId.size === 0);
 			if (applies) {
-				const p = (event.input && event.input.path) || editDiff.path;
+				const inputPath = (event as any).input?.path;
+				const p = typeof inputPath === "string" ? inputPath : editDiff.path;
 				setEditDiff(p, d.diff);
 				if (anyPanelActive()) requestRender();
 			}
@@ -1883,7 +1933,7 @@ export default function (pi: ExtensionAPI) {
 		REG.panel = panel;
 		REG.active = tuiRef.showOverlay(panel, {
 			anchor: "top-right",
-			width: Math.max(34, Math.min(48, Math.floor(cols * 0.25))),
+			width: dockColsFor(cols),
 			margin: 0,
 			maxHeight: "100%",
 			nonCapturing: true,
@@ -1922,7 +1972,7 @@ export default function (pi: ExtensionAPI) {
 				filesOn = false;
 				trimResponse = false;
 				reconcileLayout(ctx.ui.theme);
-				ctx.ui.notify("Split view off (all panels)", "info");
+				ctx.ui.notify("Split view off (all panels) · /split-save saves defaults", "info");
 			} else {
 				const cfg = normalizeConfig(loadUiPanelsConfig());
 				if (!cfg.thinking && !cfg.tools && !cfg.files && !cfg.trimResponse) {
@@ -1932,10 +1982,12 @@ export default function (pi: ExtensionAPI) {
 					thinkingOn = cfg.thinking;
 					toolsOn = cfg.tools;
 					filesOn = cfg.files;
+					showDiff = cfg.diff;
+					answerDividerMode = cfg.answerDivider;
 					trimResponse = cfg.trimResponse;
 				}
 				reconcileLayout(ctx.ui.theme);
-				ctx.ui.notify("Split view on (saved layout)", "info");
+				ctx.ui.notify("Split view on (saved layout) · /split-save saves defaults", "info");
 			}
 		},
 	});
@@ -1969,6 +2021,16 @@ export default function (pi: ExtensionAPI) {
 		description: "Toggle the files panel (dock or overlay)",
 		handler: async (_args, ctx) => {
 			toggleFilesPanel(ctx);
+		},
+	});
+
+	pi.registerCommand("split-diff", {
+		description: "Toggle the files panel's edit-diff subpanel",
+		handler: async (_args, ctx) => {
+			showDiff = !showDiff;
+			filesVersion++;
+			requestRender();
+			ctx.ui.notify(`Edit diff ${showDiff ? "on" : "off"}`, "info");
 		},
 	});
 
@@ -2021,6 +2083,22 @@ export default function (pi: ExtensionAPI) {
 			toolsWidthPct = Math.max(20, Math.min(60, n));
 			reconcileLayout(ctx.ui.theme);
 			ctx.ui.notify(`Tools panel width: ${toolsWidthPct}%`, "info");
+		},
+	});
+
+	pi.registerCommand("split-divider", {
+		description:
+			"Response-only divider between successive answers: rule | space",
+		handler: async (args, ctx) => {
+			if (ctx.mode !== "tui") return;
+			const arg = String(args ?? "").trim().toLowerCase();
+			if (arg === "rule") answerDividerMode = "rule";
+			else if (arg === "space") answerDividerMode = "space";
+			else answerDividerMode = answerDividerMode === "rule" ? "space" : "rule";
+			// Doc children were built with the old mode → rebuild from branch.
+			rebuildResponseDoc(ctx);
+			if (anyPanelActive()) requestRender();
+			ctx.ui.notify(`Answer divider: ${answerDividerMode}`, "info");
 		},
 	});
 
@@ -2085,12 +2163,14 @@ export default function (pi: ExtensionAPI) {
 				trimResponse,
 				bandHeight,
 				toolsWidthPct,
+				diff: showDiff,
+				answerDivider: answerDividerMode,
 			});
 			ctx.ui.notify(
 				saved
 					? "Panel layout saved as startup defaults for new windows"
 					: "Could not save panel layout (config write failed)",
-				saved ? "success" : "error",
+				saved ? "info" : "error",
 			);
 		},
 	});

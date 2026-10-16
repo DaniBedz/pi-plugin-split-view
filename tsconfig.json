@@ -1,0 +1,14 @@
+{
+	"compilerOptions": {
+		"target": "ES2022",
+		"lib": ["ES2022"],
+		"module": "preserve",
+		"moduleResolution": "bundler",
+		"allowImportingTsExtensions": true,
+		"types": ["node"],
+		"strict": true,
+		"skipLibCheck": true,
+		"noEmit": true
+	},
+	"files": ["split-view.ts", "layout-manager.ts", "ui-panels-config.ts"]
+}

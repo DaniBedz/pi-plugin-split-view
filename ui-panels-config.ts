@@ -29,6 +29,11 @@ export interface UiPanelsConfig {
 	tools?: boolean;
 	/** Files side panel (fullscreen dock or regular overlay). */
 	files?: boolean;
+	/** Files panel edit-diff subpanel. Defaults to true when absent. */
+	diff?: boolean;
+	/** Divider between successive assistant messages in response-only mode:
+	 * "rule" = dim dashed line, "space" = plain blank line. Defaults to "rule". */
+	answerDivider?: "rule" | "space";
 	/** Tool panel detail mode. */
 	toolMode?: ToolMode;
 	/** Panel C shows response-only (own-rendered) instead of pi's full transcript. */
@@ -53,6 +58,8 @@ export function normalizeConfig(raw: UiPanelsConfig): Required<{
 	thinking: boolean;
 	tools: boolean;
 	files: boolean;
+	diff: boolean;
+	answerDivider: "rule" | "space";
 	toolMode: ToolMode;
 	trimResponse: boolean;
 	bandHeight: number;
@@ -87,6 +94,8 @@ export function normalizeConfig(raw: UiPanelsConfig): Required<{
 		thinking: split && boolOr(root.thinking, true),
 		tools: split && boolOr(root.tools, true),
 		files: boolOr(root.files, false),
+		diff: boolOr(root.diff, true),
+		answerDivider: root.answerDivider === "space" ? "space" : "rule",
 		toolMode: tm,
 		trimResponse: boolOr(root.trimResponse, false),
 		bandHeight,

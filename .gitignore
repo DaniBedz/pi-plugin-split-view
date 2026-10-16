@@ -1,0 +1,5 @@
+node_modules/
+
+# Local Playwright/agent scratch output
+.playwright-mcp/
+*.log
