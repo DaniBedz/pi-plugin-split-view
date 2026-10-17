@@ -29,7 +29,8 @@ export interface UiPanelsConfig {
 	tools?: boolean;
 	/** Files side panel (fullscreen dock or regular overlay). */
 	files?: boolean;
-	/** Files panel edit-diff subpanel. Defaults to true when absent. */
+	/** Edits panel (recent diffs), independent of the files list. Defaults to
+	 * the `files` value when absent (the old files-dock subpanel behaviour). */
 	diff?: boolean;
 	/** Divider between successive assistant messages in response-only mode:
 	 * "rule" = dim dashed line, "space" = plain blank line. Defaults to "rule". */
@@ -72,6 +73,7 @@ export function normalizeConfig(raw: UiPanelsConfig): Required<{
 			? raw
 			: {};
 	const split = boolOr(root.split, false);
+	const files = boolOr(root.files, false);
 	const tm: ToolMode = root.toolMode === "full" ? "full" : "compact";
 	// SV-12: only a real finite number is usable; Number(null) === 0 would
 	// otherwise clamp to 6. Non-numeric/unusable values use the default.
@@ -93,8 +95,8 @@ export function normalizeConfig(raw: UiPanelsConfig): Required<{
 		split,
 		thinking: split && boolOr(root.thinking, true),
 		tools: split && boolOr(root.tools, true),
-		files: boolOr(root.files, false),
-		diff: boolOr(root.diff, true),
+		files,
+		diff: boolOr(root.diff, files),
 		answerDivider: root.answerDivider === "space" ? "space" : "rule",
 		toolMode: tm,
 		trimResponse: boolOr(root.trimResponse, false),

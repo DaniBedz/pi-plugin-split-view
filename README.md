@@ -28,8 +28,14 @@ transcript mode — composed as one clean layout layer over pi's native transcri
 - **Tool Usage panel** — every tool call with status/output preview, compact or full detail;
   history is rebuilt from the session branch on resume/branch switch.
 - **Files panel** — right dock in fullscreen (or a passive overlay in regular mode) listing
-  read/written/seen files newest-first, with a live edit-diff subpanel (hide the subpanel
-  with `/split-diff` and keep just the list); a compact status widget below the editor.
+  read/written/seen files newest-first.
+- **Edits panel** — a scrollable history of the last 10 edit diffs in the right dock,
+  toggled with `/split-diff` independently of the files list (it fills the dock alone, or
+  sits below the list when both are on). In regular mode it stays the files overlay's
+  last-edit subpanel. Inside herdr, **double-click** a diff line (or
+  its `✎ path` header) to open that file at that line in neovim, in a new herdr tab of
+  the current workspace. One nvim per pi session is reused (`nvim --listen`): an
+  already-open file just jumps to the line, otherwise it opens in a new buffer.
 - **Response-only mode** — swaps the transcript for a response-only ScrollView (user +
   assistant text, pi's own components) with a dim dashed rule between successive
   assistant answers (`/split-divider`, config `answerDivider`), reusing pi's editor
@@ -50,7 +56,7 @@ transcript mode — composed as one clean layout layer over pi's native transcri
 | `/split-tools-view` | compact ↔ full tool detail |
 | `/split-tools-width <pct>` | tools panel width as % of the band (20–60, default 35) |
 | `/files` | toggle the files panel (dock in fullscreen, overlay in regular mode) |
-| `/split-diff` | toggle the files panel's edit-diff subpanel (keep the file list only) |
+| `/split-diff` | toggle the edits panel (last 10 diffs, scrollable), independent of `/files` |
 | `/split-trim-response` | full transcript ↔ response-only view |
 | `/split-divider [rule\|space]` | response-only separator between successive answers: `rule` = dim dashed line (default), `space` = blank line |
 | `/split-height <n>` | band height in rows (6–40) |
@@ -63,7 +69,7 @@ Toggles are session-local by default (concurrent windows don't clobber each othe
 
 Tweaks you make with the toggle commands last for the current window only. When the layout
 looks right, run **`/split-save`** to store it as the startup defaults for *new* windows
-(which panels are on, band height, tools width, tool detail mode, the diff subpanel
+(which panels are on, band height, tools width, tool detail mode, the edits panel
 and the answer divider). `/split` then toggles between bare pi and that saved layout.
 
 The band and the dock need pi's fullscreen mode

@@ -22,6 +22,7 @@
 		"split-view.ts",
 		"layout-manager.ts",
 		"ui-panels-config.ts",
+		"herdr-nvim.ts",
 		"README.md",
 		"CHANGELOG.md",
 		"LICENSE",

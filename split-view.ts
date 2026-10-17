@@ -92,6 +92,8 @@ import {
 	VStack,
 	type Component,
 	type OverlayHandle,
+	type TuiMouseEvent,
+	type TuiMouseEventResult,
 	wrapTextWithAnsi,
 	truncateToWidth,
 	visibleWidth,
@@ -102,6 +104,7 @@ import {
 	normalizeConfig,
 	type ToolMode as ToolModeCfg,
 } from "./ui-panels-config.ts";
+import { inHerdr, openInHerdrNvim } from "./herdr-nvim.ts";
 import {
 	getBaseRoot,
 	initLayoutManager,
@@ -124,7 +127,6 @@ const MAX_LINES = 400;
 // work is bounded even for one giant paragraph.
 const MAX_TAIL_CHARS = 2000;
 const MAX_FILES = 500;
-const MAX_WIDGET_NAMES = 3;
 const MIN_TERM_WIDTH = 90;
 const MAX_TOOL_OUTPUT_LINES = 20;
 // OracleSpec body window: hard cap on FINAL VISUAL rows rendered by band
@@ -139,6 +141,10 @@ const LEGEND = "r read · w write · s seen(bash) · a subagent";
 // ─── module-lifetime state ───────────────────────────────────────────────────
 
 let tuiRef: any;
+/** ctx.ui.notify, for module-level code (mouse handlers). */
+let notifyRef:
+	| ((message: string, type?: "info" | "warning" | "error") => void)
+	| undefined;
 let widgetSet = false;
 let startupTimer: ReturnType<typeof setTimeout> | null = null;
 /** SV-14: the saved startup composition is still unapplied. Armed in
@@ -172,7 +178,7 @@ let toolsOn = true;
 let filesOn = false;
 /** Files panel edit-diff subpanel (session-local; /split-diff, persisted by
  * /split-save). Off keeps the file list but drops the bottom diff section. */
-let showDiff = true;
+let showDiff = false;
 /** Response-only divider between successive assistant messages: "rule" (dim
  * dashed line) or "space" (plain blank line). Session-local; /split-divider,
  * persisted by /split-save. */
@@ -366,17 +372,32 @@ const thinking = {
 	},
 };
 
+/** Drop leading/trailing blank lines and collapse internal blank runs so each
+ * thinking entry only takes the rows its text needs. */
+function compactLines(lines: string[]): string[] {
+	const out: string[] = [];
+	for (const l of lines) {
+		const blank = l.trim() === "";
+		if (blank && (out.length === 0 || out[out.length - 1].trim() === "")) continue;
+		out.push(l);
+	}
+	while (out.length && out[out.length - 1].trim() === "") out.pop();
+	return out;
+}
+
 function thinkingLines(theme: Theme, width: number): string[] {
 	const out: string[] = [];
 	const sep = theme.fg("dim", "─".repeat(Math.max(8, Math.min(60, width - 3))));
 	for (const b of thinking.blocks) {
-		if (out.length) out.push("");
+		const lines = compactLines(b.lines);
+		if (lines.length === 0) continue;
 		out.push(sep);
-		for (const l of b.lines) out.push(l);
+		for (const l of lines) out.push(l);
 	}
 	if (thinking.current) {
-		if (out.length) out.push("");
-		for (const l of thinking.current.lines) out.push(l);
+		const lines = compactLines(thinking.current.lines);
+		if (out.length && (lines.length || thinking.current.tail)) out.push(sep);
+		for (const l of lines) out.push(l);
 		if (thinking.current.tail) out.push(thinking.current.tail);
 	}
 	return out;
@@ -821,51 +842,139 @@ function displayPath(abs: string): string {
 	return abs;
 }
 
-function widgetLines(theme: Theme, width: number): string[] {
-	const entries = recentEntries();
-	if (entries.length === 0) return [];
-	const names = entries
-		.slice(0, MAX_WIDGET_NAMES)
-		.map((e) => path.basename(e.path));
-	const rest = entries.length - names.length;
-	let text = `📂 ${entries.length}`;
-	if (names.length) text += `  ${names.join(" · ")}`;
-	if (rest > 0) text += `  +${rest}`;
-	return [truncateToWidth(theme.fg("dim", text), width)];
-}
-
 // ─── edit-diff buffer ────────────────────────────────────────────────────────
 
 /**
- * Raw (unrendered) diff state for the files panel's bottom subpanel.
+ * Raw (unrendered) history of the most recent edit diffs, oldest first.
  * We store raw text (not ANSI) so it survives theme changes; `renderDiff` is
- * applied at draw time. A monotonic token guards against out-of-order async
- * diff computations overwriting a newer edit with a stale older one.
+ * applied at draw time. Each entry is keyed by its edit's toolCallId: the
+ * tool_call preview creates the entry and the tool_result's authoritative diff
+ * replaces THAT entry only, so a slow older result can never overwrite a
+ * newer edit (SV-23).
  */
-const editDiff = {
-	path: "" as string,
-	diff: "" as string,
-	version: 0,
-	token: 0,
-};
-let pendingDiffToken = 0;
-/** SV-23: edit preview/result correlation. Every edit tool_call gets a
- * monotonically increasing generation and owns the preview; a tool_result
- * applies its authoritative diff only when its toolCallId maps to the current
- * generation, so an older, slower edit can never overwrite a newer preview. */
-let editGeneration = 0;
-const editGenByCallId = new Map<string, number>();
+interface DiffEntry {
+	id: string | undefined;
+	path: string;
+	diff: string;
+	/** From the tool result. Preview diffs are computed from the edit's
+	 * snippets, so their line numbers are snippet-relative, not file lines. */
+	final: boolean;
+}
+const MAX_DIFFS = 10;
+/** Per-diff cap in the diffs panel (rendered lines, before wrapping). */
+const MAX_DIFF_LINES = 150;
+const diffHistory: DiffEntry[] = [];
+let diffVersion = 0;
 
-function setEditDiff(p: string, diff: string): void {
-	editDiff.path = p;
-	editDiff.diff = diff;
-	editDiff.version++;
+const lastDiff = (): DiffEntry | undefined =>
+	diffHistory[diffHistory.length - 1];
+
+/** Add a diff, or replace the existing entry for the same toolCallId. */
+function putEditDiff(
+	id: string | undefined,
+	p: string,
+	diff: string,
+	final: boolean,
+): void {
+	const existing =
+		id !== undefined ? diffHistory.find((d) => d.id === id) : undefined;
+	if (existing) {
+		if (p) existing.path = p;
+		existing.diff = diff;
+		existing.final = final;
+	} else {
+		diffHistory.push({ id, path: p, diff, final });
+		while (diffHistory.length > MAX_DIFFS) diffHistory.shift();
+	}
+	diffVersion++;
 }
 
-function clearEditDiff(): void {
-	editDiff.path = "";
-	editDiff.diff = "";
-	editDiff.version++;
+function clearEditDiffs(): void {
+	diffHistory.length = 0;
+	diffVersion++;
+}
+
+/** A file location a diffs-panel line opens on double-click. */
+interface DiffTarget {
+	file: string;
+	line: number;
+}
+/** Parallel to the last diffLines() output: each line's target, if any. */
+let diffTargets: (DiffTarget | undefined)[] = [];
+
+/**
+ * New-file line for each line of an edit-result diff (`+N`, `-N`, ` N`).
+ * Context and removed lines carry OLD-file numbers, so track the running
+ * new−old offset; a removed line maps to where it used to be.
+ */
+function diffLineNumbers(diff: string): (number | undefined)[] {
+	let delta = 0;
+	return diff.split(/\r?\n/).map((l) => {
+		const m = /^([+\- ])\s*(\d+) /.exec(l);
+		if (!m) return undefined;
+		const n = Number(m[2]);
+		if (m[1] === "+") {
+			delta++;
+			return n;
+		}
+		const line = Math.max(1, n + delta);
+		if (m[1] === "-") delta--;
+		return line;
+	});
+}
+
+function resolveEditPath(p: string): string {
+	if (p === "~" || p.startsWith("~/")) return path.join(homedir(), p.slice(1));
+	return path.resolve(process.cwd(), p);
+}
+
+function diffLines(theme: Theme, width: number): string[] {
+	const out: string[] = [];
+	const targets: (DiffTarget | undefined)[] = [];
+	for (const d of diffHistory) {
+		const file = d.final && d.path ? resolveEditPath(d.path) : undefined;
+		const nums = file ? diffLineNumbers(d.diff) : [];
+		const at = (line: number | undefined) =>
+			file && line !== undefined ? { file, line } : undefined;
+		const label = ` ✎ ${displayPath(d.path) || "(unknown)"} `;
+		const title = truncateToWidth(label, Math.max(1, width - 5), "…");
+		out.push(
+			theme.fg("border", "─") +
+				theme.fg("accent", title) +
+				theme.fg(
+					"border",
+					"─".repeat(Math.max(0, width - 4 - visibleWidth(title))),
+				),
+		);
+		// The header opens the first changed line.
+		const firstChange = d.diff
+			.split(/\r?\n/)
+			.findIndex((l) => /^[+-]\s*\d/.test(l));
+		targets.push(at(nums[firstChange]));
+		// renderDiff keeps one output line per diff line, in order.
+		const rendered = renderDiff(d.diff).split(/\r?\n/);
+		const aligned = rendered.length === nums.length;
+		rendered.slice(0, MAX_DIFF_LINES).forEach((l, i) => {
+			out.push(l);
+			targets.push(aligned ? at(nums[i]) : undefined);
+		});
+		if (rendered.length > MAX_DIFF_LINES) {
+			out.push(theme.fg("dim", `… +${rendered.length - MAX_DIFF_LINES} more`));
+			targets.push(undefined);
+		}
+	}
+	diffTargets = targets;
+	return out;
+}
+
+/** Double-click handler for a diffs-panel line, if it maps to a file line. */
+function diffLineAction(index: number): (() => void) | undefined {
+	const t = diffTargets[index];
+	if (!t || !inHerdr()) return undefined;
+	return () =>
+		openInHerdrNvim(t.file, t.line, process.cwd(), (msg) =>
+			notifyRef?.(`Open in nvim failed: ${msg}`, "error"),
+		);
 }
 
 // ─── shared helpers ──────────────────────────────────────────────────────────
@@ -887,7 +996,7 @@ const anyPanelActive = () =>
 // those panels running after a /split off. Layout-layer checks remain in use
 // only for layout ownership (anyPanelActive/filesActive).
 const panelsActive = () =>
-	thinkingOn || toolsOn || filesOn || trimResponse;
+	thinkingOn || toolsOn || filesOn || showDiff || trimResponse;
 const filesActive = () => isLayoutLayerActive("files") || !!REG.active;
 
 // ─── framed panel components ─────────────────────────────────────────────────
@@ -954,8 +1063,10 @@ class RecentBody {
 	private cacheVersion = -1;
 	/** SV-19: bounded width cache — keep the current width plus a small LRU of
 	 * recent widths so resize cycling cannot grow it unbounded. */
-	private cacheByWidth = new Map<number, string[]>();
+	private cacheByWidth = new Map<number, { out: string[]; src: number[] }>();
 	private static readonly MAX_CACHED_WIDTHS = 4;
+	/** Source-line index of each row of the last render (-1: filler/empty). */
+	private rowSource: number[] = [];
 	constructor(
 		private theme: Theme,
 		private style: (line: string) => string,
@@ -964,7 +1075,23 @@ class RecentBody {
 		private empty: string,
 		/** Rows to guarantee so the left edge has no gaps (viewport height). */
 		private minRows: () => number,
+		/** Cap on retained visual rows (newest kept). */
+		private maxRows: number = MAX_BODY_ROWS,
+		/** Double-click action for a source line (index into lines()), if any. */
+		private action?: (index: number) => (() => void) | undefined,
 	) {}
+	/** The layout dispatches with content-relative y (scroll offset applied).
+	 * Claim the press only on actionable rows, so text selection still works
+	 * everywhere else. */
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (!this.action || event.button !== "left") return undefined;
+		if (event.type !== "press" && event.type !== "click") return undefined;
+		const src = this.rowSource[event.y] ?? -1;
+		const act = src >= 0 ? this.action(src) : undefined;
+		if (!act) return undefined;
+		if (event.type === "click" && (event.clickCount ?? 1) >= 2) act();
+		return { handled: true, render: false };
+	}
 	render(width: number): string[] {
 		const th = this.theme;
 		const v = this.version();
@@ -978,7 +1105,8 @@ class RecentBody {
 			// delete+set moves this width to the Map's newest position.
 			this.cacheByWidth.delete(width);
 			this.cacheByWidth.set(width, cached);
-			return cached;
+			this.rowSource = cached.src;
+			return cached.out;
 		}
 		const edge = th.fg("border", "│");
 		const pad = (s: string) =>
@@ -993,7 +1121,7 @@ class RecentBody {
 		// fragment is ever split); the newest groups always fit. A single group
 		// larger than the whole cap keeps only its newest fragments.
 		const src = this.lines(width);
-		const groups: string[][] = [];
+		const groups: { index: number; frags: string[] }[] = [];
 		let used = 0;
 		for (let i = src.length - 1; i >= 0; i--) {
 			const line =
@@ -1004,17 +1132,24 @@ class RecentBody {
 				this.style(line),
 				Math.max(1, width - 3),
 			).map((w: string) => " " + w);
-			if (used + frags.length > MAX_BODY_ROWS) {
-				if (groups.length === 0 && frags.length > MAX_BODY_ROWS)
-					groups.push(frags.slice(frags.length - MAX_BODY_ROWS));
+			if (used + frags.length > this.maxRows) {
+				if (groups.length === 0 && frags.length > this.maxRows)
+					groups.push({
+						index: i,
+						frags: frags.slice(frags.length - this.maxRows),
+					});
 				break;
 			}
-			groups.push(frags);
+			groups.push({ index: i, frags });
 			used += frags.length;
 		}
 		const rows: string[] = [];
+		const rowSrc: number[] = [];
 		for (let g = groups.length - 1; g >= 0; g--)
-			for (const f of groups[g]) rows.push(f);
+			for (const f of groups[g].frags) {
+				rows.push(f);
+				rowSrc.push(groups[g].index);
+			}
 		let out: string[];
 		if (rows.length === 0) {
 			const empty = " " + th.fg("dim", this.empty);
@@ -1026,7 +1161,8 @@ class RecentBody {
 		const min = Math.max(1, this.minRows());
 		const filler = edge + " ".repeat(Math.max(0, width - 1));
 		while (out.length < min) out.push(filler);
-		this.cacheByWidth.set(width, out);
+		this.cacheByWidth.set(width, { out, src: rowSrc });
+		this.rowSource = rowSrc;
 		// SV-19: bound the number of cached widths (Map preserves insertion
 		// order; hits refresh recency above, so the first key is least-recent
 		// and eviction is true LRU).
@@ -1051,8 +1187,11 @@ class FilesPanel {
 
 	constructor(
 		private theme: Theme,
-		/** Fullscreen dock: live terminal rows. Overlay: undefined. */
+		/** Fullscreen dock: allotted rows. Overlay: undefined. */
 		private heightProvider?: () => number,
+		/** Overlay mode embeds the last-edit subpanel; the fullscreen dock shows
+		 * diffs in their own panel instead. */
+		private withDiff: () => boolean = () => showDiff,
 	) {}
 
 	// No handleInput: the regular-mode overlay is nonCapturing, so it never
@@ -1065,7 +1204,8 @@ class FilesPanel {
 			this.heightProvider?.() || termHeight || recentEntries().length + 12;
 		// Cache key MUST include height: a height-only terminal resize changes
 		// the list/diff row split without bumping filesVersion or width.
-		const key = `${filesVersion}|${editDiff.version}|${width}|${height}|${showDiff ? 1 : 0}`;
+		const showDiff = this.withDiff();
+		const key = `${filesVersion}|${diffVersion}|${width}|${height}|${showDiff ? 1 : 0}`;
 		if (key === this.cacheKey) return this.cacheLines;
 
 		const th = this.theme;
@@ -1137,6 +1277,7 @@ class FilesPanel {
 
 		// ── edit-diff subpanel (optional: /split-diff) ──
 		const diffBody: string[] = [];
+		const editDiff = lastDiff() ?? { path: "", diff: "" };
 		if (showDiff) {
 			diffBody.push(th.fg("border", `├${"─".repeat(inner)}┤`));
 			// SV-05: truncate the title by DISPLAY COLUMNS (wide/CJK/emoji paths)
@@ -1272,7 +1413,7 @@ function buildBand(theme: Theme, inner: Component): Component {
 	// dock columns (the SV-07 clamp), not the full terminal width.
 	// Single-panel bands keep the full width (no ratio involved).
 	const termCols = tuiRef?.terminal?.columns ?? 120;
-	const dockVisible = filesOn && termCols >= MIN_TERM_WIDTH;
+	const dockVisible = dockOn() && termCols >= MIN_TERM_WIDTH;
 	const base = termCols - (dockVisible ? dockColsFor(termCols) : 0);
 	const splitBand = defs.length === 2;
 	const toolsW = splitBand ? bandToolsColsFor(base) : -1;
@@ -1304,7 +1445,38 @@ function buildBand(theme: Theme, inner: Component): Component {
 		panels.length === 1
 			? panels[0]!.component
 			: new HStack(panels.map((p) => ({ ...p, shrink: 1, minSize: 1 })));
-	const sep = new (class implements Component {
+	const conversation = framedConversation(theme, inner);
+	return new VStack([
+		{
+			component: band,
+			basis: bandHeight,
+			grow: 0,
+			shrink: 1,
+			minSize: Math.min(6, bandHeight),
+		},
+		{ component: conversation, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+	]);
+}
+
+/** One border column, as tall as whatever height it is given (paint clips). */
+class BorderEdge implements Component {
+	constructor(private theme: Theme) {}
+	render(_width: number): string[] {
+		const rows = Math.max(1, tuiRef?.terminal?.rows ?? 200);
+		return new Array(rows).fill(this.theme.fg("border", "│"));
+	}
+	invalidate(): void {}
+	dispose(): void {}
+}
+
+/**
+ * Frame the conversation below the band: ╭─╮ on top, │ edges down both
+ * sides of the transcript, ╰─╯ under it. The editor dock (pi's own, or the
+ * one reused by trim mode) stays outside the frame. Falls back to just the
+ * top rule when the inner root isn't the expected VStack[transcript, dock].
+ */
+function framedConversation(theme: Theme, inner: Component): Component {
+	const top = new (class implements Component {
 		invalidate(): void {}
 		dispose(): void {}
 		render(w: number): string[] {
@@ -1315,23 +1487,140 @@ function buildBand(theme: Theme, inner: Component): Component {
 			];
 		}
 	})();
-	return new VStack([
+	const topEntry = { component: top, basis: 1, grow: 0, shrink: 0 };
+	const entries: any[] | undefined = (inner as any)?.entries;
+	const ti = Array.isArray(entries)
+		? entries.findIndex((e) => e?.component && Object.hasOwn(e.component, "child"))
+		: -1;
+	if (!entries || ti < 0)
+		return new VStack([
+			topEntry,
+			{ component: inner, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+		]);
+	const edge = { basis: 1, grow: 0, shrink: 0 };
+	const framed = new HStack([
+		{ component: new BorderEdge(theme), ...edge },
 		{
-			component: band,
-			basis: bandHeight,
-			grow: 0,
+			// Keep the HStack's height-measurement pass from rendering the
+			// whole transcript.
+			component: new MeasurementSafeVStack([
+				{ component: entries[ti].component, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+			]),
+			basis: 0,
+			grow: 1,
 			shrink: 1,
-			minSize: Math.min(6, bandHeight),
+			minSize: 1,
 		},
-		{ component: sep, basis: 1, grow: 0, shrink: 0 },
-		{ component: inner, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+		{ component: new BorderEdge(theme), ...edge },
 	]);
+	return new VStack([
+		topEntry,
+		...entries.flatMap((e, i) =>
+			i === ti
+				? [
+						{ ...e, component: framed },
+						{ component: new BorderBottom(theme), basis: 1, grow: 0, shrink: 0 },
+					]
+				: [{ ...e, component: withoutEditorGap(e.component) }],
+		),
+	]);
+}
+
+/**
+ * Re-centres status rows (e.g. a custom working-indicator spinner) that were
+ * padded to centre on the full terminal width, so they centre on the width
+ * they actually get beside the dock. Left-aligned rows are left alone.
+ */
+class RecentreLines implements Component {
+	constructor(private inner: Component) {}
+	render(width: number): string[] {
+		const lines = this.inner.render(width);
+		const cols = tuiRef?.terminal?.columns ?? width;
+		if (width >= cols) return lines;
+		return lines.map((l) => {
+			const lead = l.length - l.trimStart().length;
+			if (lead < 2) return l;
+			const rest = l.trimStart();
+			const restW = visibleWidth(rest.trimEnd());
+			if (Math.abs(lead - Math.floor((cols - restW) / 2)) > 2) return l;
+			return " ".repeat(Math.max(0, Math.floor((width - restW) / 2))) + rest;
+		});
+	}
+	invalidate(): void {
+		this.inner.invalidate?.();
+	}
+	dispose(): void {}
+}
+
+/** Replace the editor dock entry of pi's VStack[transcript, dock] root. */
+function mapDock(
+	inner: Component,
+	fn: (dock: Component) => Component,
+): Component {
+	const entries: any[] | undefined = (inner as any)?.entries;
+	if (!Array.isArray(entries)) return inner;
+	const di = entries.findIndex(
+		(e) => e?.component && !Object.hasOwn(e.component, "child"),
+	);
+	if (di < 0) return inner;
+	return new VStack(
+		entries.map((e, i) => (i === di ? { ...e, component: fn(e.component) } : e)),
+	);
+}
+
+/** Wrap the dock's status row (index 1: after pending messages). */
+function withCentredStatus(inner: Component): Component {
+	return mapDock(inner, (dock) => {
+		const entries: any[] | undefined = (dock as any)?.entries;
+		if (!Array.isArray(entries) || entries.length < 4 || !entries[1]?.component)
+			return dock;
+		return new VStack(
+			entries.map((e, i) =>
+				i === 1 ? { ...e, component: new RecentreLines(e.component) } : e,
+			),
+		);
+	});
+}
+
+/** Drops a component's leading blank row. */
+class TrimLeadingBlank implements Component {
+	constructor(private inner: Component) {}
+	render(width: number): string[] {
+		const lines = this.inner.render(width);
+		return lines.length && visibleWidth(lines[0]!.trim()) === 0
+			? lines.slice(1)
+			: lines;
+	}
+	invalidate(): void {
+		this.inner.invalidate?.();
+	}
+	dispose(): void {}
+}
+
+/**
+ * pi's dock (VStack[pending, status, widgetsAbove, editor, widgetsBelow,
+ * footer]) always starts widgetsAbove with a 1-row spacer. Under the framed
+ * conversation that row is just a gap, so drop it. Anything unexpected is
+ * returned unchanged.
+ */
+function withoutEditorGap(dock: Component): Component {
+	const entries: any[] | undefined = (dock as any)?.entries;
+	if (!Array.isArray(entries)) return dock;
+	const ei = entries.findIndex((e) => e?.minSize === 3);
+	if (ei < 3 || !entries[ei - 1]?.component) return dock;
+	return new VStack(
+		entries.map((e, i) =>
+			i === ei - 1 ? { ...e, component: new TrimLeadingBlank(e.component) } : e,
+		),
+	);
 }
 
 /** Dock width (clamped, 34–48) that the current composition was built with.
  *  SV-07: the dock basis is captured at compose time; the widget render
  *  compares it against the live terminal width and recomposes on change. */
 let composedDockCols = -1;
+/** Terminal rows the dock was composed with (files/diffs split + padding). */
+let composedDockRows = -1;
 
 /** F: explicit band split — minimum panel widths (cols) below which the
  * toolsWidthPct ratio clamps, so neither panel degenerates at narrow
@@ -1375,11 +1664,61 @@ function dockColsFor(cols: number): number {
 	return Math.max(34, Math.min(48, Math.floor(cols * 0.25)));
 }
 
+/** The right dock holds the files list and/or the diffs panel. */
+const dockOn = () => filesOn || showDiff;
+
+/** Files-list rows when it shares the dock with the diffs panel. */
+const dockFilesRows = () =>
+	Math.max(6, Math.floor((tuiRef?.terminal?.rows ?? 24) * 0.4));
+
+function buildDiffsPanel(theme: Theme, rows: () => number): Component {
+	return framedPanel(
+		theme,
+		new BorderTop(theme, "Edits", "accent", () => false),
+		new RecentBody(
+			theme,
+			(l) => l,
+			(w) => diffLines(theme, w),
+			() => diffVersion,
+			"No edits yet",
+			() => Math.max(1, rows() - 2),
+			MAX_DIFFS * (MAX_DIFF_LINES + 2) * 2,
+			diffLineAction,
+		),
+	);
+}
+
+function buildDockPanel(theme: Theme): Component {
+	const termRows = () => tuiRef?.terminal?.rows ?? 0;
+	if (filesOn && showDiff) {
+		const filesRows = dockFilesRows();
+		return new VStack([
+			{
+				component: new FilesPanel(theme, () => filesRows, () => false),
+				basis: filesRows,
+				grow: 0,
+				shrink: 1,
+				minSize: 4,
+			},
+			{
+				component: buildDiffsPanel(theme, () => termRows() - filesRows),
+				basis: 0,
+				grow: 1,
+				shrink: 1,
+				minSize: 3,
+			},
+		]);
+	}
+	if (filesOn) return new FilesPanel(theme, termRows, () => false);
+	return buildDiffsPanel(theme, termRows);
+}
+
 function buildFilesDock(theme: Theme, inner: Component): Component {
 	const cols = tuiRef?.terminal?.columns ?? 120;
 	const panelCols = dockColsFor(cols);
 	composedDockCols = panelCols;
-	const panel = new FilesPanel(theme, () => tuiRef?.terminal?.rows ?? 0);
+	composedDockRows = tuiRef?.terminal?.rows ?? 0;
+	const panel = buildDockPanel(theme);
 	// Wrap the left subtree in a MeasurementSafeVStack — the dock
 	// HStack's discarded intrinsic-height measurement would otherwise eagerly
 	// render the ENTIRE left side (band + transcript) every keystroke frame.
@@ -1450,21 +1789,21 @@ function buildTrimInner(theme: Theme): Component | null {
 function composeLayout(theme: Theme, inner: Component): Component {
 	// Trim mode swaps pi's transcript for the response doc; the base root's
 	// dock (editor/footer) is preserved inside the swapped inner.
-	let root = inner;
+	let root = withCentredStatus(inner);
 	if (trimResponse) {
 		const trimmed = buildTrimInner(theme);
-		if (trimmed) root = trimmed;
+		if (trimmed) root = withCentredStatus(trimmed);
 	}
 	const wantBand = thinkingOn || toolsOn;
 	if (wantBand) root = buildBand(theme, root);
-	if (filesOn && tuiRef && typeof tuiRef.setLayoutRoot === "function")
+	if (dockOn() && tuiRef && typeof tuiRef.setLayoutRoot === "function")
 		root = buildFilesDock(theme, root);
 	return root;
 }
 
 /** Reconcile the single "ui" layout layer with the current panel flags. */
 function reconcileLayout(theme: Theme): void {
-	const wantAny = thinkingOn || toolsOn || filesOn || trimResponse;
+	const wantAny = thinkingOn || toolsOn || dockOn() || trimResponse;
 	if (!wantAny || !tuiRef || typeof tuiRef.setLayoutRoot !== "function") {
 		if (isLayoutLayerActive("ui")) setLayoutLayer("ui", null);
 		return;
@@ -1490,6 +1829,7 @@ export default function (pi: ExtensionAPI) {
 			WIDGET_KEY,
 			(tui, theme) => {
 				tuiRef = tui;
+				notifyRef = (m, t) => ctx.ui.notify(m, t);
 				docTheme = theme;
 				initLayoutManager(tui);
 				// SV-14: apply the still-pending startup composition here. The
@@ -1525,13 +1865,14 @@ export default function (pi: ExtensionAPI) {
 						// clamp and the <90 hide rule are preserved (hide/show stays
 						// dynamic via the entry's visible callback).
 						if (
-							filesOn &&
+							dockOn() &&
 							typeof tuiRef?.setLayoutRoot === "function" &&
 							isLayoutLayerActive("ui")
 						) {
 							const cols = tuiRef?.terminal?.columns ?? 120;
 							const want = dockColsFor(cols);
-							if (want !== composedDockCols)
+							const rows = tuiRef?.terminal?.rows ?? 0;
+							if (want !== composedDockCols || rows !== composedDockRows)
 								reconcileLayout(ctx.ui.theme);
 						}
 						// F2: same recompose hook for the band's explicit width split,
@@ -1547,7 +1888,9 @@ export default function (pi: ExtensionAPI) {
 							if (cols !== composedBandTermCols)
 								reconcileLayout(ctx.ui.theme);
 						}
-						return widgetLines(liveTheme, width);
+						// The files summary bar is hidden; the widget stays registered
+						// only for the layout self-heal/recompose hooks above.
+						return [];
 					},
 					invalidate: () => {},
 				};
@@ -1564,11 +1907,13 @@ export default function (pi: ExtensionAPI) {
 		toolsVersionCounter++;
 		files.clear();
 		bumpFilesVersion();
-		clearEditDiff();
+		clearEditDiffs();
 		rebuildResponseDoc(ctx);
 
 		const branch = ctx.sessionManager.getBranch();
 		const thoughts: string[] = [];
+		/** edit toolCallId → path, so persisted results get their file name. */
+		const editPaths = new Map<string, string>();
 		for (const entry of branch) {
 			if (entry.type !== "message") continue;
 			const msg = (entry as any).message;
@@ -1578,6 +1923,12 @@ export default function (pi: ExtensionAPI) {
 					if (c?.type === "thinking" && typeof c.thinking === "string")
 						thoughts.push(c.thinking);
 					if (c?.type === "toolCall" && c.name) {
+						if (
+							c.name === "edit" &&
+							typeof c.id === "string" &&
+							typeof c.arguments?.path === "string"
+						)
+							editPaths.set(c.id, c.arguments.path);
 						try {
 							// SV-17: rebuild the bounded tools buffer from the
 							// branch through the same ingest path live events use.
@@ -1590,12 +1941,15 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 			}
-			// Reconstruct the last edit diff from persisted tool-result details.
+			// Reconstruct the recent edit diffs from persisted tool-result details.
 			if (msg.role === "toolResult" && msg.toolName === "edit") {
 				const d = msg.details;
 				if (d?.diff) {
-					const p = (msg.input && msg.input.path) || editDiff.path;
-					setEditDiff(p, d.diff);
+					const id =
+						typeof msg.toolCallId === "string" ? msg.toolCallId : undefined;
+					const p =
+						(id && editPaths.get(id)) || msg.input?.path || "";
+					putEditDiff(id, p, d.diff, true);
 				}
 			}
 			// SV-17: rebuild tool outputs from persisted results, correlated
@@ -1631,6 +1985,7 @@ export default function (pi: ExtensionAPI) {
 				thinking: false,
 				tools: false,
 				files: false,
+				diff: false,
 				trimResponse: false,
 			};
 		}
@@ -1742,13 +2097,7 @@ export default function (pi: ExtensionAPI) {
 		const input = event.input ?? {};
 		const p = typeof input.path === "string" ? input.path : "";
 		const edits = Array.isArray(input.edits) ? input.edits : [];
-		const token = ++pendingDiffToken;
-		// SV-23: this call is the newest edit — it owns the preview; forget
-		// older generations so a late result from an older edit cannot match.
-		const gen = ++editGeneration;
-		editGenByCallId.clear();
-		if (typeof event.toolCallId === "string")
-			editGenByCallId.set(event.toolCallId, gen);
+		const id = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
 		// Compute a diff from the edit pairs (synchronous, no file read needed).
 		// generateDiffString(oldText, newText, contextLines) produces a unified diff.
 		const parts: string[] = [];
@@ -1757,8 +2106,8 @@ export default function (pi: ExtensionAPI) {
 			const n = typeof e.newText === "string" ? e.newText : "";
 			if (o !== n) parts.push(generateDiffString(o, n, 3).diff);
 		}
-		if (token !== pendingDiffToken) return;
-		if (parts.length) setEditDiff(p, parts.join("\n"));
+		// Preview entry, keyed by toolCallId; the result replaces it in place.
+		if (parts.length) putEditDiff(id, p, parts.join("\n"), false);
 		try {
 			record("edit", input);
 		} catch {
@@ -1772,23 +2121,25 @@ export default function (pi: ExtensionAPI) {
 		// Authoritative diff from the result details (branch-correct).
 		const d = (event as any).details;
 		if (d?.diff) {
-			// SV-23: apply only when this result belongs to the current edit
-			// generation (its own preview); an older result never overwrites a
-			// newer preview. A result with no/unknown ID applies only when
-			// unambiguous (a single edit generation, no recorded ID).
-			const id = (event as any).toolCallId;
-			const gen = typeof id === "string" ? editGenByCallId.get(id) : undefined;
-			const applies =
-				gen === editGeneration ||
-				(gen === undefined &&
-					editGeneration === 1 &&
-					editGenByCallId.size === 0);
-			if (applies) {
-				const inputPath = (event as any).input?.path;
-				const p = typeof inputPath === "string" ? inputPath : editDiff.path;
-				setEditDiff(p, d.diff);
-				if (anyPanelActive()) requestRender();
+			// SV-23: the result replaces only its own preview entry (matched by
+			// toolCallId), so an older, slower result never touches a newer
+			// edit. Without an ID it refines the newest entry for the same path.
+			const rawId = (event as any).toolCallId;
+			const inputPath = (event as any).input?.path;
+			const p = typeof inputPath === "string" ? inputPath : "";
+			const id = typeof rawId === "string" ? rawId : undefined;
+			if (id === undefined) {
+				const last = lastDiff();
+				if (last && last.id === undefined && (!p || last.path === p)) {
+					last.diff = d.diff;
+					last.final = true;
+					diffVersion++;
+					if (anyPanelActive()) requestRender();
+					return;
+				}
 			}
+			putEditDiff(id, p, d.diff, true);
+			if (anyPanelActive()) requestRender();
 		}
 	});
 
@@ -1970,12 +2321,19 @@ export default function (pi: ExtensionAPI) {
 				thinkingOn = false;
 				toolsOn = false;
 				filesOn = false;
+				showDiff = false;
 				trimResponse = false;
 				reconcileLayout(ctx.ui.theme);
 				ctx.ui.notify("Split view off (all panels) · /split-save saves defaults", "info");
 			} else {
 				const cfg = normalizeConfig(loadUiPanelsConfig());
-				if (!cfg.thinking && !cfg.tools && !cfg.files && !cfg.trimResponse) {
+				if (
+					!cfg.thinking &&
+					!cfg.tools &&
+					!cfg.files &&
+					!cfg.diff &&
+					!cfg.trimResponse
+				) {
 					thinkingOn = true;
 					toolsOn = true;
 				} else {
@@ -2025,12 +2383,17 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("split-diff", {
-		description: "Toggle the files panel's edit-diff subpanel",
+		description:
+			"Toggle the edits panel (last 10 diffs, scrollable), independent of /files",
 		handler: async (_args, ctx) => {
 			showDiff = !showDiff;
 			filesVersion++;
+			// Fullscreen: the edits panel is its own dock entry; regular mode
+			// keeps it as the files overlay's last-edit subpanel.
+			if (tuiRef && typeof tuiRef.setLayoutRoot === "function")
+				reconcileLayout(ctx.ui.theme);
 			requestRender();
-			ctx.ui.notify(`Edit diff ${showDiff ? "on" : "off"}`, "info");
+			ctx.ui.notify(`Edits panel ${showDiff ? "on" : "off"}`, "info");
 		},
 	});
 

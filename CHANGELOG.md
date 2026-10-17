@@ -2,6 +2,25 @@
 
 Notable changes to `pi-split-view`. Versioning is [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Double-click a line in the Edits panel (inside herdr, fullscreen mode) to open the file
+  at that line in neovim, in a reused herdr tab of the current workspace (`herdr-nvim.ts`).
+
+### Changed
+
+- `/split-diff` now toggles a standalone **Edits panel** in the right dock, independent of
+  the files list: a scrollable history of the last 10 edit diffs (newest at the bottom).
+  Its saved default follows `files` when `diff` is absent from `ui-panels.json`.
+- The status bar below the editor (`📂 N file · file …`) is gone.
+- The conversation below the thinking/tools band is now fully framed (side edges and a
+  bottom border), not just a top rule with corners. The editor stays outside the frame.
+- Status rows padded to centre on the full terminal (e.g. a custom working-indicator
+  spinner) are re-centred on the space left of the right dock.
+- Thinking entries no longer carry leading/trailing/repeated blank lines.
+
 ## [1.1.0] — 2026-10-16
 
 ### Added
