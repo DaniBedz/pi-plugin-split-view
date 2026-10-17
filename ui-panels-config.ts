@@ -7,7 +7,9 @@
  *
  * IMPORTANT: the JSON on disk is a TEMPLATE of startup defaults, NOT live
  * state. Toggle commands only mutate in-process state (session-local);
- * only /split-save writes the current layout back to disk. This keeps
+ * only /split-save writes the current layout back to disk. The one
+ * exception is panel SIZES: a drag-resize saves just the size keys
+ * (saveUiPanelsSizes), leaving the panel toggles alone. This keeps
  * concurrent pi windows from clobbering each other's panels.
  */
 
@@ -43,6 +45,9 @@ export interface UiPanelsConfig {
 	bandHeight?: number;
 	/** Tools panel's share of the band width in percent (20–60, default 35). */
 	toolsWidthPct?: number;
+	/** Right dock width in columns (24+, set by dragging its edge). Absent:
+	 * 25% of the terminal, clamped to 34–48. */
+	dockWidth?: number;
 }
 
 /** SV-12: strict boolean read — only real booleans count; absent or
@@ -65,6 +70,7 @@ export function normalizeConfig(raw: UiPanelsConfig): Required<{
 	trimResponse: boolean;
 	bandHeight: number;
 	toolsWidthPct: number;
+	dockWidth: number | null;
 }> {
 	// SV-12: tolerate any shape — a null root, an array or a primitive reads
 	// as an empty config instead of throwing on property access.
@@ -91,6 +97,11 @@ export function normalizeConfig(raw: UiPanelsConfig): Required<{
 			? Math.trunc(rawPct)
 			: 35;
 	const toolsWidthPct = Math.max(20, Math.min(60, usablePct));
+	const rawDock: unknown = root.dockWidth;
+	const dockWidth =
+		typeof rawDock === "number" && Number.isFinite(rawDock)
+			? Math.max(24, Math.trunc(rawDock))
+			: null;
 	return {
 		split,
 		thinking: split && boolOr(root.thinking, true),
@@ -102,6 +113,7 @@ export function normalizeConfig(raw: UiPanelsConfig): Required<{
 		trimResponse: boolOr(root.trimResponse, false),
 		bandHeight,
 		toolsWidthPct,
+		dockWidth,
 	};
 }
 
@@ -132,6 +144,14 @@ export function saveUiPanelsConfig(cfg: UiPanelsConfig): boolean {
 		/* never break the extension on a config write failure */
 		return false;
 	}
+}
+
+/** Merge just the panel size keys into the saved config (drag-resize
+ * auto-save); every other key on disk is kept as is. */
+export function saveUiPanelsSizes(
+	sizes: Pick<UiPanelsConfig, "bandHeight" | "toolsWidthPct" | "dockWidth">,
+): boolean {
+	return saveUiPanelsConfig({ ...loadUiPanelsConfig(), ...sizes });
 }
 
 /**

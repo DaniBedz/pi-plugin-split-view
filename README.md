@@ -36,6 +36,10 @@ transcript mode — composed as one clean layout layer over pi's native transcri
   its `✎ path` header) to open that file at that line in neovim, in a new herdr tab of
   the current workspace. One nvim per pi session is reused (`nvim --listen`): an
   already-open file just jumps to the line, otherwise it opens in a new buffer.
+- **Drag to resize** (fullscreen) — drag the border between the band and the conversation
+  to change the band height, the edge between the conversation and the right dock to
+  change the dock width, and the edge between the Thinking and Tool Usage panels to change
+  their split. Sizes are saved to `ui-panels.json` when you let go.
 - **Response-only mode** — swaps the transcript for a response-only ScrollView (user +
   assistant text, pi's own components) with a dim dashed rule between successive
   assistant answers (`/split-divider`, config `answerDivider`), reusing pi's editor
@@ -63,13 +67,14 @@ transcript mode — composed as one clean layout layer over pi's native transcri
 | `/split-save` | persist the current layout as startup defaults for new windows |
 
 Toggles are session-local by default (concurrent windows don't clobber each other); only
-`/split-save` writes the config file.
+`/split-save` writes the config file. The exception is a drag-resize, which saves just
+the panel sizes (`bandHeight`, `toolsWidthPct`, `dockWidth`).
 
 ### Persisting your layout
 
 Tweaks you make with the toggle commands last for the current window only. When the layout
 looks right, run **`/split-save`** to store it as the startup defaults for *new* windows
-(which panels are on, band height, tools width, tool detail mode, the edits panel
+(which panels are on, band height, tools width, dock width, tool detail mode, the edits panel
 and the answer divider). `/split` then toggles between bare pi and that saved layout.
 
 The band and the dock need pi's fullscreen mode

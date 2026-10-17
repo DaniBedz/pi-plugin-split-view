@@ -104,6 +104,7 @@ import {
 import {
 	loadUiPanelsConfig,
 	saveUiPanelsConfig,
+	saveUiPanelsSizes,
 	normalizeConfig,
 	type ToolMode as ToolModeCfg,
 } from "./ui-panels-config.ts";
@@ -194,6 +195,9 @@ let bandHeight = 14;
 /** F: tools panel's share of the band width in percent (20–60, default 35,
  * persisted as toolsWidthPct; session-local, only /split-save writes it). */
 let toolsWidthPct = 35;
+/** Right dock width in columns once dragged (persisted as dockWidth); null =
+ * the automatic 25%-of-terminal width, clamped to 34–48. */
+let dockWidth: number | null = null;
 
 /** SV-08: fingerprint of the live theme's panel-relevant colors, captured
  * when the composition was built. pi replaces the global theme object on a
@@ -1014,6 +1018,137 @@ const panelsActive = () =>
 	thinkingOn || toolsOn || filesOn || showDiff || trimResponse;
 const filesActive = () => isLayoutLayerActive("files") || !!REG.active;
 
+// ─── drag-to-resize ──────────────────────────────────────────────────────────
+
+/**
+ * A draggable panel boundary. `value()` is the size when the drag starts;
+ * `set(start, delta)` applies a drag of `delta` cells along `axis` and
+ * returns whether the size changed. Grips are module constants, so their
+ * identity survives the recompose each drag step triggers.
+ */
+interface Grip {
+	axis: "x" | "y";
+	value: () => number;
+	set: (start: number, delta: number) => boolean;
+}
+
+/** Border cells of one component that start a drag: its first/last column,
+ * or any cell of the row. */
+interface Grips {
+	row?: Grip;
+	left?: Grip;
+	right?: Grip;
+}
+
+/** The drag in progress. pi sends every drag/release to the component that
+ * took the press (`owner`), even after a recompose dropped it from the
+ * layout. */
+let gripDrag: {
+	owner: object;
+	grip: Grip;
+	from: number;
+	start: number;
+	moved: boolean;
+} | null = null;
+/** Theme of the last composition, for recomposing mid-drag. */
+let layoutTheme: Theme | null = null;
+
+/** Columns the conversation side always keeps when the dock is dragged wide. */
+const MIN_LEFT_COLS = 50;
+
+const clamp = (n: number, lo: number, hi: number) =>
+	Math.max(lo, Math.min(Math.max(lo, hi), n));
+const termCols = () => tuiRef?.terminal?.columns ?? 120;
+const termRows = () => tuiRef?.terminal?.rows ?? 24;
+
+/** Top band height: drag the band's bottom border or the conversation's top. */
+const BAND_GRIP: Grip = {
+	axis: "y",
+	value: () => bandHeight,
+	set: (start, delta) => {
+		const next = clamp(start + delta, 6, Math.min(40, termRows() - 8));
+		if (next === bandHeight) return false;
+		bandHeight = next;
+		return true;
+	},
+};
+
+/** Right dock width: drag the edge between the conversation and the dock. */
+const DOCK_GRIP: Grip = {
+	axis: "x",
+	value: () => dockColsFor(termCols()),
+	set: (start, delta) => {
+		const before = dockColsFor(termCols());
+		dockWidth = clamp(start - delta, 24, termCols() - MIN_LEFT_COLS);
+		return dockColsFor(termCols()) !== before;
+	},
+};
+
+/** Thinking | Tool Usage split: drag the edge between the two panels. */
+const SPLIT_GRIP: Grip = {
+	axis: "x",
+	value: () => bandToolsColsFor(bandBaseCols()),
+	set: (start, delta) => {
+		const base = Math.max(1, bandBaseCols());
+		const next = clamp(Math.round(((start - delta) * 100) / base), 20, 60);
+		if (next === toolsWidthPct) return false;
+		toolsWidthPct = next;
+		return true;
+	},
+};
+
+/** Persist the sizes once a drag ends (size keys only; see
+ * saveUiPanelsSizes). */
+function saveSizes(): void {
+	const ok = saveUiPanelsSizes({
+		bandHeight,
+		toolsWidthPct,
+		...(dockWidth === null ? {} : { dockWidth }),
+	});
+	if (!ok) notifyRef?.("Could not save panel sizes (config write failed)", "error");
+}
+
+/**
+ * Mouse handler for a component with grip cells. A left press on a grip cell
+ * starts a drag; the drag events and release pi then routes to the same
+ * component resize live and save on release. Anything else is unhandled.
+ */
+function gripsMouse(
+	owner: object,
+	grips: Grips | undefined,
+	event: TuiMouseEvent,
+): TuiMouseEventResult | undefined {
+	const d = gripDrag;
+	if (d && d.owner === owner && event.type === "drag") {
+		const pos = d.grip.axis === "x" ? event.screenX : event.screenY;
+		if (!d.grip.set(d.start, pos - d.from))
+			return { handled: true, render: false };
+		d.moved = true;
+		if (layoutTheme) reconcileLayout(layoutTheme);
+		return { handled: true, render: true };
+	}
+	if (d && d.owner === owner && event.type === "release") {
+		gripDrag = null;
+		if (d.moved) saveSizes();
+		return { handled: true, render: false };
+	}
+	if (!grips || event.type !== "press" || event.button !== "left")
+		return undefined;
+	const grip =
+		(event.x === 0 && grips.left) ||
+		(event.x === event.width - 1 && grips.right) ||
+		grips.row;
+	if (!grip) return undefined;
+	gripDrag = {
+		owner,
+		grip,
+		from: grip.axis === "x" ? event.screenX : event.screenY,
+		start: grip.value(),
+		moved: false,
+	};
+	return { handled: true, render: false };
+}
+
 // ─── framed panel components ─────────────────────────────────────────────────
 
 class BorderTop {
@@ -1022,7 +1157,11 @@ class BorderTop {
 		private title: string,
 		private color: "accent" | "muted",
 		private streaming: () => boolean,
+		private grips?: Grips,
 	) {}
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		return gripsMouse(this, this.grips, event);
+	}
 	render(width: number): string[] {
 		const th = this.theme;
 		const contentWidth = Math.max(1, width - 2);
@@ -1040,7 +1179,13 @@ class BorderTop {
 }
 
 class BorderBottom {
-	constructor(private theme: Theme) {}
+	constructor(
+		private theme: Theme,
+		private grips?: Grips,
+	) {}
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		return gripsMouse(this, this.grips, event);
+	}
 	render(width: number): string[] {
 		return [
 			this.theme.fg("border", "╰") +
@@ -1094,11 +1239,19 @@ class RecentBody {
 		private maxRows: number = MAX_BODY_ROWS,
 		/** Double-click action for a source line (index into lines()), if any. */
 		private action?: (index: number) => (() => void) | undefined,
+		/** Drag handle on the left │ edge, if any. */
+		private leftGrip?: Grip,
 	) {}
 	/** The layout dispatches with content-relative y (scroll offset applied).
-	 * Claim the press only on actionable rows, so text selection still works
-	 * everywhere else. */
+	 * Claim the press only on actionable rows (or the left grip edge), so text
+	 * selection still works everywhere else. */
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		const g = gripsMouse(
+			this,
+			this.leftGrip ? { left: this.leftGrip } : undefined,
+			event,
+		);
+		if (g) return g;
 		if (!this.action || event.button !== "left") return undefined;
 		if (event.type !== "press" && event.type !== "click") return undefined;
 		const src = this.rowSource[event.y] ?? -1;
@@ -1208,6 +1361,15 @@ class FilesPanel {
 		 * diffs in their own panel instead. */
 		private withDiff: () => boolean = () => showDiff,
 	) {}
+
+	/** In the fullscreen dock the left │ edge resizes the dock. */
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		return gripsMouse(
+			this,
+			this.heightProvider ? { left: DOCK_GRIP } : undefined,
+			event,
+		);
+	}
 
 	// No handleInput: the regular-mode overlay is nonCapturing, so it never
 	// receives keys — Escape belongs to the editor/Pi, and /files is the
@@ -1364,6 +1526,7 @@ function framedPanel(
 	theme: Theme,
 	top: Component,
 	body: RecentBody,
+	bottomGrips?: Grips,
 ): Component {
 	const scroll = new ScrollView(body, {
 		follow: "end",
@@ -1382,7 +1545,12 @@ function framedPanel(
 	return new MeasurementSafeVStack([
 		{ component: top, basis: 1, grow: 0, shrink: 0 },
 		{ component: scroll, basis: 0, grow: 1, shrink: 1, minSize: 1 },
-		{ component: new BorderBottom(theme), basis: 1, grow: 0, shrink: 0 },
+		{
+			component: new BorderBottom(theme, bottomGrips),
+			basis: 1,
+			grow: 0,
+			shrink: 0,
+		},
 	]);
 }
 
@@ -1427,24 +1595,39 @@ function buildBand(theme: Theme, inner: Component): Component {
 	// visible (filesOn, ≥ MIN_TERM_WIDTH) that is the terminal width minus the
 	// dock columns (the SV-07 clamp), not the full terminal width.
 	// Single-panel bands keep the full width (no ratio involved).
-	const termCols = tuiRef?.terminal?.columns ?? 120;
-	const dockVisible = dockOn() && termCols >= MIN_TERM_WIDTH;
-	const base = termCols - (dockVisible ? dockColsFor(termCols) : 0);
+	const cols = termCols();
+	const dockVisible = dockOn() && cols >= MIN_TERM_WIDTH;
+	const base = bandBaseCols();
 	const splitBand = defs.length === 2;
 	const toolsW = splitBand ? bandToolsColsFor(base) : -1;
 	const thinkW = base - toolsW;
-	composedBandTermCols = termCols;
+	composedBandTermCols = cols;
 
 	let di = 0;
 	for (const d of defs) {
-		const top = new BorderTop(theme, d.title, d.color, d.streaming);
-		// defs order: thinking first (when on), then tools.
+		// defs order: thinking first (when on), then tools. The tools panel's
+		// left edge is the Thinking | Tool Usage divider.
+		const splitGrip = splitBand && di === 1 ? SPLIT_GRIP : undefined;
+		const top = new BorderTop(theme, d.title, d.color, d.streaming, {
+			left: splitGrip,
+		});
 		const w = splitBand ? (di === 0 ? thinkW : toolsW) : 1;
 		panels.push({
 			component: framedPanel(
 				theme,
 				top,
-				new RecentBody(theme, d.style, d.lines, d.version, d.empty, minRows),
+				new RecentBody(
+					theme,
+					d.style,
+					d.lines,
+					d.version,
+					d.empty,
+					minRows,
+					MAX_BODY_ROWS,
+					undefined,
+					splitGrip,
+				),
+				{ row: BAND_GRIP, left: splitGrip },
 			),
 			basis: w,
 			grow: splitBand ? 0 : 1,
@@ -1460,7 +1643,11 @@ function buildBand(theme: Theme, inner: Component): Component {
 		panels.length === 1
 			? panels[0]!.component
 			: new HStack(panels.map((p) => ({ ...p, shrink: 1, minSize: 1 })));
-	const conversation = framedConversation(theme, inner);
+	const conversation = framedConversation(
+		theme,
+		inner,
+		dockVisible ? DOCK_GRIP : undefined,
+	);
 	return new VStack([
 		{
 			component: band,
@@ -1475,7 +1662,13 @@ function buildBand(theme: Theme, inner: Component): Component {
 
 /** One border column, as tall as whatever height it is given (paint clips). */
 class BorderEdge implements Component {
-	constructor(private theme: Theme) {}
+	constructor(
+		private theme: Theme,
+		private grip?: Grip,
+	) {}
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		return gripsMouse(this, this.grip ? { left: this.grip } : undefined, event);
+	}
 	render(_width: number): string[] {
 		const rows = Math.max(1, tuiRef?.terminal?.rows ?? 200);
 		return new Array(rows).fill(this.theme.fg("border", "│"));
@@ -1489,11 +1682,20 @@ class BorderEdge implements Component {
  * sides of the transcript, ╰─╯ under it. The editor dock (pi's own, or the
  * one reused by trim mode) stays outside the frame. Falls back to just the
  * top rule when the inner root isn't the expected VStack[transcript, dock].
+ * The top rule resizes the band; with the dock beside it, the right edge
+ * resizes the dock (`dockGrip`).
  */
-function framedConversation(theme: Theme, inner: Component): Component {
+function framedConversation(
+	theme: Theme,
+	inner: Component,
+	dockGrip?: Grip,
+): Component {
 	const top = new (class implements Component {
 		invalidate(): void {}
 		dispose(): void {}
+		handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+			return gripsMouse(this, { row: BAND_GRIP, right: dockGrip }, event);
+		}
 		render(w: number): string[] {
 			return [
 				theme.fg("border", "╭") +
@@ -1526,7 +1728,7 @@ function framedConversation(theme: Theme, inner: Component): Component {
 			shrink: 1,
 			minSize: 1,
 		},
-		{ component: new BorderEdge(theme), ...edge },
+		{ component: new BorderEdge(theme, dockGrip), ...edge },
 	]);
 	return new VStack([
 		topEntry,
@@ -1534,7 +1736,12 @@ function framedConversation(theme: Theme, inner: Component): Component {
 			i === ti
 				? [
 						{ ...e, component: framed },
-						{ component: new BorderBottom(theme), basis: 1, grow: 0, shrink: 0 },
+						{
+							component: new BorderBottom(theme, { right: dockGrip }),
+							basis: 1,
+							grow: 0,
+							shrink: 0,
+						},
 					]
 				: [{ ...e, component: withoutEditorGap(e.component) }],
 		),
@@ -1718,7 +1925,15 @@ let composedBandTermCols = -1;
  * by buildFilesDock and buildBand so the band split uses the SAME allocated
  * base the dock actually takes. */
 function dockColsFor(cols: number): number {
+	if (dockWidth !== null) return clamp(dockWidth, 24, cols - MIN_LEFT_COLS);
 	return Math.max(34, Math.min(48, Math.floor(cols * 0.25)));
+}
+
+/** Width the top band is split across: the terminal minus the dock when the
+ * dock is visible. */
+function bandBaseCols(): number {
+	const cols = termCols();
+	return cols - (dockOn() && cols >= MIN_TERM_WIDTH ? dockColsFor(cols) : 0);
 }
 
 /** The right dock holds the files list and/or the diffs panel. */
@@ -1731,7 +1946,7 @@ const dockFilesRows = () =>
 function buildDiffsPanel(theme: Theme, rows: () => number): Component {
 	return framedPanel(
 		theme,
-		new BorderTop(theme, "Edits", "accent", () => false),
+		new BorderTop(theme, "Edits", "accent", () => false, { left: DOCK_GRIP }),
 		new RecentBody(
 			theme,
 			(l) => l,
@@ -1741,7 +1956,9 @@ function buildDiffsPanel(theme: Theme, rows: () => number): Component {
 			() => Math.max(1, rows() - 2),
 			MAX_DIFFS * (MAX_DIFF_LINES + 2) * 2,
 			diffLineAction,
+			DOCK_GRIP,
 		),
+		{ left: DOCK_GRIP },
 	);
 }
 
@@ -1865,6 +2082,7 @@ function reconcileLayout(theme: Theme): void {
 		if (isLayoutLayerActive("ui")) setLayoutLayer("ui", null);
 		return;
 	}
+	layoutTheme = theme;
 	setLayoutLayer("ui", (inner: Component) => composeLayout(theme, inner));
 	// SV-08: remember the theme this composition was built with.
 	composedThemeFp = themeFingerprint(theme);
@@ -2051,6 +2269,7 @@ export default function (pi: ExtensionAPI) {
 		toolMode = cfg.toolMode;
 		bandHeight = cfg.bandHeight;
 		toolsWidthPct = cfg.toolsWidthPct;
+		dockWidth = cfg.dockWidth;
 		filesOn = cfg.files;
 		showDiff = cfg.diff;
 		answerDividerMode = cfg.answerDivider;
@@ -2583,6 +2802,7 @@ export default function (pi: ExtensionAPI) {
 				trimResponse,
 				bandHeight,
 				toolsWidthPct,
+				...(dockWidth === null ? {} : { dockWidth }),
 				diff: showDiff,
 				answerDivider: answerDividerMode,
 			});

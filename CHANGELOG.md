@@ -8,6 +8,10 @@ Notable changes to `pi-split-view`. Versioning is [SemVer](https://semver.org/).
 
 - Double-click a line in the Edits panel (inside herdr, fullscreen mode) to open the file
   at that line in neovim, in a reused herdr tab of the current workspace (`herdr-nvim.ts`).
+- Drag-to-resize (fullscreen): the band/conversation border sets the band height, the
+  conversation/dock edge sets the dock width (new `dockWidth` config key, 24+ columns),
+  and the Thinking/Tool Usage edge sets `toolsWidthPct`. Each drag saves just those size
+  keys to `ui-panels.json` on release; `/split-save` now includes `dockWidth` too.
 
 ### Changed
 
