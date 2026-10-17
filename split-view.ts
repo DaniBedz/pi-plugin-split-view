@@ -2173,7 +2173,8 @@ function buildDiffsPanel(theme: Theme, rows: () => number): Component {
 }
 
 function buildDockPanel(theme: Theme): Component {
-	const termRows = () => tuiRef?.terminal?.rows ?? 0;
+	// The full-width footer sits below the dock, so the dock gets the rest.
+	const termRows = () => Math.max(1, (tuiRef?.terminal?.rows ?? 0) - footerRows);
 	if (filesOn && showDiff) {
 		const filesRows = dockFilesRows();
 		return new VStack([
@@ -2269,6 +2270,43 @@ function buildTrimInner(theme: Theme): Component | null {
 	]);
 }
 
+/** Rows the full-width footer rendered last frame (measured before the dock). */
+let footerRows = 0;
+
+class MeasuredFooter implements Component {
+	constructor(private inner: Component) {}
+	render(width: number): string[] {
+		const lines = this.inner.render(width);
+		footerRows = lines.length;
+		return lines;
+	}
+	invalidate(): void {
+		this.inner.invalidate?.();
+	}
+	dispose(): void {}
+}
+
+/**
+ * Pull pi's footer (last dock entry, after the editor) out of
+ * VStack[transcript, dock], so it can span the full terminal width under the
+ * right dock instead of being squeezed beside it. Null if the shape is unexpected.
+ */
+function splitFooter(
+	inner: Component,
+): { rest: Component; footer: Component } | null {
+	let footer: Component | null = null;
+	const rest = mapDock(inner, (dock) => {
+		const entries: any[] | undefined = (dock as any)?.entries;
+		if (!Array.isArray(entries)) return dock;
+		const ei = entries.findIndex((e) => e?.minSize === 3);
+		const last = entries.length - 1;
+		if (ei < 0 || last <= ei || !entries[last]?.component) return dock;
+		footer = entries[last].component;
+		return new VStack(entries.slice(0, last));
+	});
+	return footer ? { rest, footer } : null;
+}
+
 /** Build the full composed layout root based on enabled panels. */
 function composeLayout(theme: Theme, inner: Component): Component {
 	// Trim mode swaps pi's transcript for the response doc; the base root's
@@ -2279,10 +2317,22 @@ function composeLayout(theme: Theme, inner: Component): Component {
 		if (trimmed) root = withCentredStatus(trimmed);
 	}
 	const wantBand = thinkingOn || toolsOn;
+	const wantDock =
+		dockOn() && tuiRef && typeof tuiRef.setLayoutRoot === "function";
+	const split = wantDock ? splitFooter(root) : null;
+	if (split) root = split.rest;
+	footerRows = 0;
 	if (wantBand) root = buildBand(theme, root);
-	if (dockOn() && tuiRef && typeof tuiRef.setLayoutRoot === "function")
-		root = buildFilesDock(theme, root);
-	return root;
+	if (wantDock) root = buildFilesDock(theme, root);
+	if (!split) return root;
+	// Same inset as the editor under the framed band (see withoutEditorGap).
+	const footer = new MeasuredFooter(
+		wantBand ? new FlushEdges(split.footer) : split.footer,
+	);
+	return new VStack([
+		{ component: root, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+		{ component: footer, basis: "auto", grow: 0, shrink: 0, minSize: 0 },
+	]);
 }
 
 /** Reconcile the single "ui" layout layer with the current panel flags. */
