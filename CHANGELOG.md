@@ -18,8 +18,14 @@ Notable changes to `pi-split-view`. Versioning is [SemVer](https://semver.org/).
 - The conversation below the thinking/tools band is now fully framed (side edges and a
   bottom border), not just a top rule with corners. The editor stays outside the frame.
 - Status rows padded to centre on the full terminal (e.g. a custom working-indicator
-  spinner) are re-centred on the space left of the right dock.
+  spinner) are re-centred on the space left of the right dock, without the blank row
+  pi's loader puts above them.
+- While the conversation is framed, an editor and footer with 1-column blank side
+  margins (e.g. a chat-bubble editor) are widened by 2 columns so they line up with
+  the frame.
 - Thinking entries no longer carry leading/trailing/repeated blank lines.
+- Response-only mode shows a skill invocation as pi's collapsed `[skill] name` line
+  (click to expand) instead of the full skill text.
 
 ## [1.1.0] — 2026-10-16
 

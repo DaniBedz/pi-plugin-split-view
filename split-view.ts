@@ -79,6 +79,8 @@ import {
 	renderDiff,
 	AssistantMessageComponent,
 	UserMessageComponent,
+	SkillInvocationMessageComponent,
+	parseSkillBlock,
 	getMarkdownTheme,
 	type ExtensionAPI,
 	type ExtensionContext,
@@ -95,6 +97,7 @@ import {
 	type TuiMouseEvent,
 	type TuiMouseEventResult,
 	wrapTextWithAnsi,
+	sliceByColumn,
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
@@ -476,7 +479,19 @@ function addResponseMessage(msg: any): void {
 			const text = messageText(msg);
 			if (!text.trim()) return;
 			beginResponseEntry("user");
-			responseDoc.addChild(new UserMessageComponent(text, getMarkdownTheme()));
+			// A skill invocation shows as pi's collapsed one-line `[skill] name`
+			// (click to expand), followed by any message typed after it.
+			const skill = parseSkillBlock(text);
+			if (skill) {
+				responseDoc.addChild(
+					new SkillInvocationMessageComponent(skill, getMarkdownTheme()),
+				);
+				if (!skill.userMessage?.trim()) return;
+				responseDoc.addChild(new Spacer(1));
+			}
+			responseDoc.addChild(
+				new UserMessageComponent(skill?.userMessage ?? text, getMarkdownTheme()),
+			);
 			return;
 		}
 		if (msg.role === "assistant") {
@@ -1530,11 +1545,16 @@ function framedConversation(theme: Theme, inner: Component): Component {
  * Re-centres status rows (e.g. a custom working-indicator spinner) that were
  * padded to centre on the full terminal width, so they centre on the width
  * they actually get beside the dock. Left-aligned rows are left alone.
+ * Also drops the blank row pi's Loader puts above the indicator, so it sits
+ * flush between the conversation frame and the editor.
  */
 class RecentreLines implements Component {
 	constructor(private inner: Component) {}
 	render(width: number): string[] {
-		const lines = this.inner.render(width);
+		let lines = this.inner.render(width);
+		const first = lines.findIndex((l) => visibleWidth(l.trim()) > 0);
+		// Copy, never mutate: inner components may return a cached array.
+		lines = first < 0 ? [] : lines.slice(first);
 		const cols = tuiRef?.terminal?.columns ?? width;
 		if (width >= cols) return lines;
 		return lines.map((l) => {
@@ -1610,9 +1630,46 @@ function withoutEditorGap(dock: Component): Component {
 	if (ei < 3 || !entries[ei - 1]?.component) return dock;
 	return new VStack(
 		entries.map((e, i) =>
-			i === ei - 1 ? { ...e, component: new TrimLeadingBlank(e.component) } : e,
+			i === ei - 1
+				? { ...e, component: new TrimLeadingBlank(e.component) }
+				: // The editor, and the footer below it, keep their insets.
+					i === ei || (i === entries.length - 1 && i > ei)
+					? { ...e, component: new FlushEdges(e.component) }
+					: e,
 		),
 	);
+}
+
+const isBlankCell = (l: string, col: number) =>
+	visibleWidth(sliceByColumn(l, col, 1).trim()) === 0;
+
+/**
+ * An editor that keeps a 1-column blank margin on each side (e.g. a chat-
+ * bubble editor) looks 2 columns narrower than the framed conversation above
+ * it. Render it 2 columns wider and cut the margins off, so its edges line up
+ * with the frame. The footer gets the same treatment so it stays inset from
+ * the editor by the same amount. Rows without blank margins render unchanged.
+ */
+class FlushEdges implements Component {
+	constructor(private inner: Component) {}
+	render(width: number): string[] {
+		const wide = this.inner.render(width + 2);
+		const flush =
+			wide.length > 0 &&
+			wide.every(
+				(l) =>
+					visibleWidth(l) <= width + 2 &&
+					isBlankCell(l, 0) &&
+					(visibleWidth(l) <= width + 1 || isBlankCell(l, width + 1)),
+			);
+		if (!flush) return this.inner.render(width);
+		// sliceByColumn stops at the cut, dropping any trailing reset.
+		return wide.map((l) => sliceByColumn(l, 1, width) + "\x1b[0m");
+	}
+	invalidate(): void {
+		this.inner.invalidate?.();
+	}
+	dispose(): void {}
 }
 
 /** Dock width (clamped, 34–48) that the current composition was built with.
