@@ -519,11 +519,18 @@ function messageText(msg: any): string {
 	return "";
 }
 
-/** Content with thinking blocks and tool calls stripped (panel C is response-only). */
+/** Meridian (Claude SDK proxy) appends a "Files changed:" list to the reply text. */
+const FILES_CHANGED_FOOTER = /\s*Files changed:\n(?: *- [^\n]*(?:\n|$))+\s*$/;
+
+/** Content with thinking blocks, tool calls and the Meridian files footer stripped (panel C is response-only). */
 function responseContent(msg: any): any[] {
-	return (Array.isArray(msg?.content) ? msg.content : []).filter(
-		(c: any) => c?.type !== "thinking" && c?.type !== "toolCall",
-	);
+	return (Array.isArray(msg?.content) ? msg.content : [])
+		.filter((c: any) => c?.type !== "thinking" && c?.type !== "toolCall")
+		.map((c: any) =>
+			c?.type === "text" && typeof c.text === "string" && FILES_CHANGED_FOOTER.test(c.text)
+				? { ...c, text: c.text.replace(FILES_CHANGED_FOOTER, "") }
+				: c,
+		);
 }
 
 /** Append a message to the response doc (user or assistant). */
