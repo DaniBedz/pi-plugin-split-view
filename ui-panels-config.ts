@@ -48,6 +48,9 @@ export interface UiPanelsConfig {
 	/** Right dock width in columns (24+, set by dragging its edge). Absent:
 	 * 25% of the terminal, clamped to 34–48. */
 	dockWidth?: number;
+	/** Time chips (posted at + time into the turn) on thinking, tool and
+	 * conversation entries. Defaults to true. */
+	timestamps?: boolean;
 }
 
 /** SV-12: strict boolean read — only real booleans count; absent or
@@ -71,6 +74,7 @@ export function normalizeConfig(raw: UiPanelsConfig): Required<{
 	bandHeight: number;
 	toolsWidthPct: number;
 	dockWidth: number | null;
+	timestamps: boolean;
 }> {
 	// SV-12: tolerate any shape — a null root, an array or a primitive reads
 	// as an empty config instead of throwing on property access.
@@ -114,6 +118,7 @@ export function normalizeConfig(raw: UiPanelsConfig): Required<{
 		bandHeight,
 		toolsWidthPct,
 		dockWidth,
+		timestamps: boolOr(root.timestamps, true),
 	};
 }
 

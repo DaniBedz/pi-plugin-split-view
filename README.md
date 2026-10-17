@@ -40,6 +40,11 @@ transcript mode — composed as one clean layout layer over pi's native transcri
   to change the band height, the edge between the conversation and the right dock to
   change the dock width, and the edge between the Thinking and Tool Usage panels to change
   their split. Sizes are saved to `ui-panels.json` when you let go.
+- **Time chips** — each thinking block, tool call, prompt and answer starts with a pill
+  showing when it was posted; thinking blocks and tool calls also get a pill with how
+  long that step took (counting up live while it runs). Thinking durations are kept in a
+  hidden `split-view-thinking-times` entry in the session file, so they survive a reload. `/split-timestamps` toggles them; config key
+  `timestamps` (default on).
 - **Response-only mode** — swaps the transcript for a response-only ScrollView (user +
   assistant text, pi's own components) with a dim dashed rule between successive
   assistant answers (`/split-divider`, config `answerDivider`), reusing pi's editor
@@ -61,6 +66,7 @@ transcript mode — composed as one clean layout layer over pi's native transcri
 | `/split-tools-width <pct>` | tools panel width as % of the band (20–60, default 35) |
 | `/files` | toggle the files panel (dock in fullscreen, overlay in regular mode) |
 | `/split-diff` | toggle the edits panel (last 10 diffs, scrollable), independent of `/files` |
+| `/split-timestamps` | toggle the time chips on thinking, tool and conversation entries |
 | `/split-trim-response` | full transcript ↔ response-only view |
 | `/split-divider [rule\|space]` | response-only separator between successive answers: `rule` = dim dashed line (default), `space` = blank line |
 | `/split-height <n>` | band height in rows (6–40) |

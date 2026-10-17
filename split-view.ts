@@ -80,6 +80,7 @@ import {
 	AssistantMessageComponent,
 	UserMessageComponent,
 	SkillInvocationMessageComponent,
+	ToolExecutionComponent,
 	parseSkillBlock,
 	getMarkdownTheme,
 	type ExtensionAPI,
@@ -109,6 +110,7 @@ import {
 	type ToolMode as ToolModeCfg,
 } from "./ui-panels-config.ts";
 import { inHerdr, openInHerdrNvim } from "./herdr-nvim.ts";
+import { isPlainBlank, timeChips } from "./timestamps.ts";
 import {
 	getBaseRoot,
 	initLayoutManager,
@@ -198,6 +200,12 @@ let toolsWidthPct = 35;
 /** Right dock width in columns once dragged (persisted as dockWidth); null =
  * the automatic 25%-of-terminal width, clamped to 34–48. */
 let dockWidth: number | null = null;
+/** Time chips on thinking, tool and conversation entries (persisted as
+ * `timestamps`; /split-timestamps). */
+let timestampsOn = true;
+/** An agent run is in progress: a still-running thinking block or tool
+ * call's duration chip counts up live. */
+let agentRunning = false;
 
 /** SV-08: fingerprint of the live theme's panel-relevant colors, captured
  * when the composition was built. pi replaces the global theme object on a
@@ -227,6 +235,9 @@ interface ThinkingBlock {
 	lines: string[];
 	tail: string;
 	complete: boolean;
+	/** Started / finished at (ms since epoch). */
+	at?: number;
+	end?: number;
 }
 
 /**
@@ -287,6 +298,21 @@ function markToolsDirty(): void {
 	if (!toolsFlushTimer) toolsFlushTimer = setTimeout(flushTools, TOOLS_FLUSH_MS);
 }
 
+/** Custom session entry logging thinking durations: `{ ts, blocks }`, where
+ * `ts` is the assistant message's timestamp. */
+const THINK_TIMES_ENTRY = "split-view-thinking-times";
+/** Content index → [started, finished] (ms since epoch). */
+type ThinkTimes = Record<number, [number, number]>;
+
+function newThinkingBlock(): ThinkingBlock {
+	return {
+		lines: [],
+		tail: "",
+		complete: false,
+		at: Date.now(),
+	};
+}
+
 const thinking = {
 	blocks: [] as ThinkingBlock[],
 	current: null as ThinkingBlock | null,
@@ -295,14 +321,15 @@ const thinking = {
 	start() {
 		if (this.current && (this.current.lines.length || this.current.tail)) {
 			this.current.complete = true;
+			this.current.end ??= Date.now();
 			this.blocks.push(this.current);
 		}
-		this.current = { lines: [], tail: "", complete: false };
+		this.current = newThinkingBlock();
 		this.streaming = true;
 		this.version++;
 	},
 	append(delta: string) {
-		if (!this.current) this.current = { lines: [], tail: "", complete: false };
+		if (!this.current) this.current = newThinkingBlock();
 		this.current.tail += delta;
 		if (this.current.tail.length > MAX_TAIL_CHARS)
 			this.current.tail = this.current.tail.slice(-MAX_TAIL_CHARS);
@@ -331,6 +358,7 @@ const thinking = {
 				this.current.tail = "";
 			}
 			this.current.complete = true;
+			this.current.end ??= Date.now();
 			this.blocks.push(this.current);
 			this.current = null;
 			this.trim();
@@ -392,20 +420,42 @@ function compactLines(lines: string[]): string[] {
 	return out;
 }
 
+/** Time chips for an entry, or "" when off or the time is unknown. */
+function entryChips(
+	theme: Theme,
+	at: number | undefined,
+	end: number | undefined,
+	live = false,
+): string {
+	if (!timestampsOn || at === undefined) return "";
+	return timeChips((s) => theme.fg("muted", s), at, end, live);
+}
+
 function thinkingLines(theme: Theme, width: number): string[] {
 	const out: string[] = [];
 	const sep = theme.fg("dim", "─".repeat(Math.max(8, Math.min(60, width - 3))));
+	// Chips lead the entry's first line; the text after them is re-styled
+	// because a chip resets the foreground colour.
+	const stamp = (b: ThinkingBlock, first: string) => {
+		const chips = entryChips(theme, b.at, b.end, agentRunning && !b.complete);
+		return chips ? `${chips} ${theme.fg("thinkingText", first)}` : first;
+	};
 	for (const b of thinking.blocks) {
 		const lines = compactLines(b.lines);
 		if (lines.length === 0) continue;
+		lines[0] = stamp(b, lines[0]);
 		out.push(sep);
 		for (const l of lines) out.push(l);
 	}
 	if (thinking.current) {
-		const lines = compactLines(thinking.current.lines);
-		if (out.length && (lines.length || thinking.current.tail)) out.push(sep);
+		const cur = thinking.current;
+		const lines = compactLines(cur.lines);
+		let tail = cur.tail;
+		if (lines.length) lines[0] = stamp(cur, lines[0]);
+		else if (tail) tail = stamp(cur, tail);
+		if (out.length && (lines.length || tail)) out.push(sep);
 		for (const l of lines) out.push(l);
-		if (thinking.current.tail) out.push(thinking.current.tail);
+		if (tail) out.push(tail);
 	}
 	return out;
 }
@@ -607,9 +657,16 @@ interface ToolEntry {
 	isError: boolean;
 	subagent?: boolean;
 	agent?: string;
+	/** Started / finished at (ms since epoch). */
+	at: number;
+	end?: number;
 }
 const toolsBy = new Map<string, ToolEntry>();
 const toolOrder: string[] = [];
+/** toolCallId → call time, for the transcript's tool chips. Outlives the
+ * MAX_TOOLS panel buffer, bounded separately. */
+const toolTimes = new Map<string, { at: number; end?: number }>();
+const MAX_TOOL_TIMES = 2000;
 
 /** True if c is a UTF-16 high (lead) surrogate — the first half of an astral
  * code point. Used to keep truncation cuts off surrogate-pair boundaries. */
@@ -690,7 +747,12 @@ function setToolOutput(e: ToolEntry, text: string): void {
  * branch reconstruction (resume / session_tree), so the bounded buffer,
  * the newest-first display and the MAX_TOOLS eviction (oldest shifted out)
  * behave identically for resumed and live entries. */
-function ingestToolCall(id: string, name: string, args: any): void {
+function ingestToolCall(
+	id: string,
+	name: string,
+	args: any,
+	at = Date.now(),
+): void {
 	toolOrder.push(id);
 	toolsBy.set(id, {
 		id,
@@ -699,7 +761,13 @@ function ingestToolCall(id: string, name: string, args: any): void {
 		output: "",
 		active: true,
 		isError: false,
+		at,
 	});
+	if (!toolTimes.has(id)) {
+		toolTimes.set(id, { at });
+		if (toolTimes.size > MAX_TOOL_TIMES)
+			toolTimes.delete(toolTimes.keys().next().value!);
+	}
 	toolsVersionCounter++;
 	if (toolOrder.length > MAX_TOOLS) {
 		const evict = toolOrder.shift()!;
@@ -710,12 +778,20 @@ function ingestToolCall(id: string, name: string, args: any): void {
 /** SV-17: ingest one tool result, correlated to its call by id (live event
  * or resumed branch entry). A result whose call is not in the bounded buffer
  * (evicted or unknown) is ignored. */
-function ingestToolResult(id: string, result: any, isError: boolean): void {
+function ingestToolResult(
+	id: string,
+	result: any,
+	isError: boolean,
+	end = Date.now(),
+): void {
+	const t = toolTimes.get(id);
+	if (t) t.end ??= end;
 	const e = toolsBy.get(id);
 	if (!e) return;
 	const text = resultText(result);
 	if (text) setToolOutput(e, text);
 	e.active = false;
+	e.end ??= end;
 	e.isError = isError;
 	cancelPendingToolsFlush();
 	toolsVersionCounter++;
@@ -742,7 +818,8 @@ function toolLines(theme: Theme, width: number): string[] {
 				? th.fg("error", e.name)
 				: th.fg("success", e.name);
 		const badge = e.subagent ? th.fg("muted", `[${e.agent ?? "sub"}]`) : "";
-		const prefix = `${mark} ${name}${badge}`;
+		const chips = entryChips(th, e.at, e.end, agentRunning && e.active);
+		const prefix = `${chips ? `${chips} ` : ""}${mark} ${name}${badge}`;
 		const room = textWidth - visibleWidth(prefix) - 1;
 		const args =
 			e.args && room >= 8
@@ -770,6 +847,139 @@ function toolLines(theme: Theme, width: number): string[] {
 }
 
 const toolsVersion = () => toolsVersionCounter;
+
+// ─── conversation time chips ──────────────────────────────────────────────────────
+
+/** User message text → posted at. pi's UserMessageComponent keeps only the
+ * text, so the transcript matches by it (a repeated prompt shows the latest
+ * time). Skill blocks are keyed by their content. */
+const userTimes = new Map<string, number>();
+const MAX_USER_TIMES = 500;
+
+function putUserTime(key: string, at: number): void {
+	userTimes.delete(key);
+	userTimes.set(key, at);
+	if (userTimes.size > MAX_USER_TIMES)
+		userTimes.delete(userTimes.keys().next().value!);
+}
+
+/** Record a user message's time; returns it (undefined if not a user
+ * message with text). */
+function noteUserTime(msg: any): number | undefined {
+	if (msg?.role !== "user") return undefined;
+	const text = messageText(msg);
+	if (!text.trim()) return undefined;
+	const at = typeof msg.timestamp === "number" ? msg.timestamp : Date.now();
+	putUserTime(text, at);
+	const skill = parseSkillBlock(text);
+	if (skill) {
+		putUserTime(`\0skill\0${skill.content}`, at);
+		if (skill.userMessage) putUserTime(skill.userMessage, at);
+	}
+	return at;
+}
+
+const STAMP_KEY = Symbol.for("pi-split-view.transcript-stamps");
+type Stamper = (c: any, lines: string[], width: number) => string[];
+
+/**
+ * Draw time chips into a message container's rendered rows. Chips only go
+ * into existing blank rows (the spacer above a user message, the blank first
+ * row of an assistant message or tool call), so row counts and pi's mouse
+ * hit-testing never change.
+ */
+function stampTranscript(c: any, lines: string[], width: number): string[] {
+	if (!timestampsOn || REG.gen !== MY_GEN) return lines;
+	const theme = layoutTheme ?? docTheme;
+	const kids = c.mouseLayout?.width === width ? c.mouseLayout.children : null;
+	if (!theme || !Array.isArray(kids)) return lines;
+	let out = lines;
+	let y = 0;
+	let skillAt: number | undefined;
+	let skillAbove = false;
+	for (const { component: k, height: h } of kids) {
+		const top = y;
+		y += h;
+		if (!h) continue;
+		if (
+			!(k instanceof Spacer) &&
+			!(k instanceof SkillInvocationMessageComponent) &&
+			!(k instanceof UserMessageComponent)
+		)
+			skillAbove = false;
+		let at: number | undefined;
+		let end: number | undefined;
+		let live = false;
+		let row = top;
+		if (k instanceof UserMessageComponent) {
+			const t = userTimes.get((k as any).text);
+			// The text typed after a skill shares the skill's chips.
+			const shared = skillAbove && t !== undefined && t === skillAt;
+			skillAbove = false;
+			if (shared) continue;
+			at = t;
+			row = top - 1;
+		} else if (k instanceof SkillInvocationMessageComponent) {
+			const content = (k as any).skillBlock?.content;
+			at = skillAt = userTimes.get(`\0skill\0${content}`);
+			row = top - 1;
+			skillAbove = true;
+		} else if (k instanceof AssistantMessageComponent) {
+			const ts = (k as any).lastMessage?.timestamp;
+			at = typeof ts === "number" ? ts : undefined;
+		} else if (k instanceof ToolExecutionComponent) {
+			const t = toolTimes.get((k as any).toolCallId);
+			at = t?.at;
+			end = t?.end;
+			live = agentRunning;
+		} else continue;
+		if (at === undefined || row < 0 || !isPlainBlank(out[row])) continue;
+		const chips = " " + entryChips(theme, at, end, live);
+		if (visibleWidth(chips) > width) continue;
+		if (out === lines) out = lines.slice();
+		out[row] = chips;
+	}
+	return out;
+}
+(globalThis as any)[STAMP_KEY] = stampTranscript as Stamper;
+
+/** Route a plain Container's render through the current generation's
+ * stamper. Patched once per container; a reload just swaps the stamper. */
+function stampContainer(c: any): void {
+	if (!c || c[STAMP_KEY] || Object.getPrototypeOf(c) !== Container.prototype)
+		return;
+	const orig = c.render;
+	c[STAMP_KEY] = true;
+	c.render = function (width: number): string[] {
+		const lines = orig.call(this, width);
+		const stamp = (globalThis as any)[STAMP_KEY] as Stamper | undefined;
+		try {
+			return stamp ? stamp(this, lines, width) : lines;
+		} catch {
+			return lines;
+		}
+	};
+}
+
+/** pi's transcript document holds header, resources and chat containers. */
+function stampDocument(doc: any): void {
+	if (!Array.isArray(doc?.children)) return;
+	for (const c of doc.children) stampContainer(c);
+}
+
+stampContainer(responseDoc);
+
+/** Hook pi's own transcript: the fullscreen ScrollView's document, or the
+ * TUI's first child in regular mode. Cheap to call repeatedly. */
+function stampPiTranscript(): void {
+	const entries = (getBaseRoot() as any)?.entries;
+	if (Array.isArray(entries)) {
+		for (const e of entries) {
+			const c = e?.component;
+			if (c && Object.hasOwn(c, "child")) stampDocument(c.child);
+		}
+	} else stampDocument(tuiRef?.children?.[0]);
+}
 
 // ─── files buffer ────────────────────────────────────────────────────────────
 
@@ -2119,6 +2329,7 @@ export default function (pi: ExtensionAPI) {
 				return {
 					render: (width: number) => {
 						selfHealLayout();
+						stampPiTranscript();
 						// SV-08: pi swaps the global theme object on a theme change
 						// (extensions get no event) and the composition + response doc
 						// capture ANSI at build time. Compare a color fingerprint and
@@ -2174,6 +2385,10 @@ export default function (pi: ExtensionAPI) {
 		);
 	};
 
+	/** Thinking start/end of the assistant message being streamed, by content
+	 * index; logged on message_end. */
+	let pendingThinkTimes: ThinkTimes = {};
+
 	/** Rebuild all buffers from the current branch (start / reload / tree). */
 	const reconstruct = (ctx: ExtensionContext) => {
 		thinking.reset();
@@ -2186,17 +2401,31 @@ export default function (pi: ExtensionAPI) {
 		rebuildResponseDoc(ctx);
 
 		const branch = ctx.sessionManager.getBranch();
-		const thoughts: string[] = [];
+		const thoughts: { text: string; at?: number; end?: number }[] = [];
+		/** assistant message timestamp → logged thinking start/end by content index. */
+		const thinkTimes = new Map<number, ThinkTimes>();
+		for (const entry of branch as any[]) {
+			const d = entry?.data;
+			if (entry?.type === "custom" && entry.customType === THINK_TIMES_ENTRY)
+				if (typeof d?.ts === "number" && d.blocks) thinkTimes.set(d.ts, d.blocks);
+		}
 		/** edit toolCallId → path, so persisted results get their file name. */
 		const editPaths = new Map<string, string>();
 		for (const entry of branch) {
 			if (entry.type !== "message") continue;
 			const msg = (entry as any).message;
 			if (!msg) continue;
+			if (msg.role === "user") noteUserTime(msg);
+			const at = typeof msg.timestamp === "number" ? msg.timestamp : undefined;
 			if (msg.role === "assistant" && Array.isArray(msg.content)) {
-				for (const c of msg.content) {
-					if (c?.type === "thinking" && typeof c.thinking === "string")
-						thoughts.push(c.thinking);
+				const times = at === undefined ? undefined : thinkTimes.get(at);
+				for (const [i, c] of msg.content.entries()) {
+					if (c?.type === "thinking" && typeof c.thinking === "string") {
+						const t = times?.[i];
+						thoughts.push(
+							t ? { text: c.thinking, at: t[0], end: t[1] } : { text: c.thinking, at },
+						);
+					}
 					if (c?.type === "toolCall" && c.name) {
 						if (
 							c.name === "edit" &&
@@ -2208,7 +2437,7 @@ export default function (pi: ExtensionAPI) {
 							// SV-17: rebuild the bounded tools buffer from the
 							// branch through the same ingest path live events use.
 							if (typeof c.id === "string")
-								ingestToolCall(c.id, c.name, c.arguments ?? {});
+								ingestToolCall(c.id, c.name, c.arguments ?? {}, at ?? Date.now());
 							record(c.name, c.arguments ?? {});
 						} catch {
 							/* skip */
@@ -2231,7 +2460,12 @@ export default function (pi: ExtensionAPI) {
 			// to their calls by toolCallId.
 			if (msg.role === "toolResult" && typeof msg.toolCallId === "string") {
 				try {
-					ingestToolResult(msg.toolCallId, msg.content, msg.isError);
+					ingestToolResult(
+						msg.toolCallId,
+						msg.content,
+						msg.isError,
+						typeof msg.timestamp === "number" ? msg.timestamp : undefined,
+					);
 				} catch {
 					/* skip */
 				}
@@ -2239,7 +2473,13 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (thoughts.length) {
 			for (const t of thoughts) {
-				thinking.current = { lines: t.split(/\r?\n/), tail: "", complete: true };
+				thinking.current = {
+					lines: t.text.split(/\r?\n/),
+					tail: "",
+					complete: true,
+					at: t.at,
+					end: t.end,
+				};
 				thinking.blocks.push(thinking.current);
 				thinking.current = null;
 			}
@@ -2274,6 +2514,7 @@ export default function (pi: ExtensionAPI) {
 		showDiff = cfg.diff;
 		answerDividerMode = cfg.answerDivider;
 		trimResponse = cfg.trimResponse;
+		timestampsOn = cfg.timestamps;
 		// SV-14: arm the startup composition BEFORE reconstruct — the widget
 		// factory runs synchronously inside it and is the first point where the
 		// fullscreen root is available (before the first paint). The deferred
@@ -2317,7 +2558,12 @@ export default function (pi: ExtensionAPI) {
 		if (d) {
 			if (d.type === "thinking_start") thinking.start();
 			else if (d.type === "thinking_delta") thinking.append(d.delta ?? "");
-			else if (d.type === "thinking_end") thinking.end(d.content ?? "");
+			else if (d.type === "thinking_end") {
+				thinking.end(d.content ?? "");
+				const b = thinking.blocks[thinking.blocks.length - 1];
+				if (b?.at !== undefined && b.end !== undefined && Number.isInteger(d.contentIndex))
+					pendingThinkTimes[d.contentIndex] = [b.at, b.end];
+			}
 		}
 		responseMessageUpdate((event as any).message);
 		if (anyPanelActive()) requestRender();
@@ -2329,11 +2575,54 @@ export default function (pi: ExtensionAPI) {
 	// so tool-only / thinking-only rounds add nothing to the doc.
 	pi.on("message_start", (event) => {
 		const msg = (event as any).message;
-		if (msg?.role === "user") addResponseMessage(msg);
+		if (msg?.role === "assistant") pendingThinkTimes = {};
+		if (msg?.role === "user") {
+			noteUserTime(msg);
+			addResponseMessage(msg);
+		}
 		if (anyPanelActive()) requestRender();
 	});
+
+	// Live duration chips: tick once a second while the agent runs.
+	let chipTicker: ReturnType<typeof setInterval> | null = null;
+	const bumpChips = () => {
+		thinking.version++;
+		toolsVersionCounter++;
+		if (anyPanelActive()) requestRender();
+	};
+	const stopChipTicker = () => {
+		if (chipTicker) clearInterval(chipTicker);
+		chipTicker = null;
+	};
+	pi.on("agent_start", () => {
+		agentRunning = true;
+		stopChipTicker();
+		chipTicker = setInterval(() => {
+			if (REG.gen !== MY_GEN) return stopChipTicker();
+			if (timestampsOn) bumpChips();
+		}, 1000);
+	});
+	pi.on("agent_end", () => {
+		agentRunning = false;
+		stopChipTicker();
+		bumpChips();
+	});
 	pi.on("message_end", (event) => {
-		responseMessageEnd((event as any).message);
+		const msg = (event as any).message;
+		// pi doesn't persist thinking durations: log them as a custom session
+		// entry (not sent to the model, not shown) so a rebuild can restore them.
+		if (msg?.role === "assistant") {
+			const blocks = pendingThinkTimes;
+			pendingThinkTimes = {};
+			if (typeof msg.timestamp === "number" && Object.keys(blocks).length) {
+				try {
+					pi.appendEntry(THINK_TIMES_ENTRY, { ts: msg.timestamp, blocks });
+				} catch {
+					/* timing is cosmetic; never break the turn */
+				}
+			}
+		}
+		responseMessageEnd(msg);
 		if (anyPanelActive()) requestRender();
 	});
 
@@ -2458,6 +2747,7 @@ export default function (pi: ExtensionAPI) {
 			isError: false,
 			subagent: true,
 			agent,
+			at: Date.now(),
 		});
 		toolsVersionCounter++;
 		if (toolOrder.length > MAX_TOOLS) {
@@ -2673,6 +2963,17 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("split-timestamps", {
+		description:
+			"Toggle time chips (posted at, step duration) on thinking, tool and conversation entries",
+		handler: async (_args, ctx) => {
+			timestampsOn = !timestampsOn;
+			bumpChips();
+			tuiRef?.requestRender?.(true);
+			ctx.ui.notify(`Time chips ${timestampsOn ? "on" : "off"}`, "info");
+		},
+	});
+
 	pi.registerCommand("split-tools-view", {
 		description: "Toggle tool panel compact ↔ full detail",
 		handler: async (_args, ctx) => {
@@ -2805,6 +3106,7 @@ export default function (pi: ExtensionAPI) {
 				...(dockWidth === null ? {} : { dockWidth }),
 				diff: showDiff,
 				answerDivider: answerDividerMode,
+				timestamps: timestampsOn,
 			});
 			ctx.ui.notify(
 				saved

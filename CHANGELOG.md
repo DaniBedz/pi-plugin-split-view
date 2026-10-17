@@ -6,6 +6,11 @@ Notable changes to `pi-split-view`. Versioning is [SemVer](https://semver.org/).
 
 ### Added
 
+- Time chips (`timestamps.ts`): thinking blocks, tool calls and conversation messages
+  start with a posted-at pill; thinking blocks and tool calls add a step-duration pill
+  (live while the step runs). Thinking durations, which pi doesn't persist, are logged as
+  a hidden `split-view-thinking-times` custom session entry so they survive a reload. `/split-timestamps` toggles; new `timestamps` config key, saved by
+  `/split-save`.
 - Double-click a line in the Edits panel (inside herdr, fullscreen mode) to open the file
   at that line in neovim, in a reused herdr tab of the current workspace (`herdr-nvim.ts`).
 - Drag-to-resize (fullscreen): the band/conversation border sets the band height, the
