@@ -110,7 +110,7 @@ import {
 	type ToolMode as ToolModeCfg,
 } from "./ui-panels-config.ts";
 import { inHerdr, openInHerdrNvim } from "./herdr-nvim.ts";
-import { isPlainBlank, timeChips } from "./timestamps.ts";
+import { capTail, isPlainBlank, timeChips } from "./timestamps.ts";
 import {
 	getBaseRoot,
 	initLayoutManager,
@@ -435,10 +435,13 @@ function thinkingLines(theme: Theme, width: number): string[] {
 	const out: string[] = [];
 	const sep = theme.fg("dim", "─".repeat(Math.max(8, Math.min(60, width - 3))));
 	// Chips lead the entry's first line; the text after them is re-styled
-	// because a chip resets the foreground colour.
+	// because a chip resets the foreground colour. The text is capped here so
+	// the dock's own line cap never cuts the chips off a long first line.
 	const stamp = (b: ThinkingBlock, first: string) => {
 		const chips = entryChips(theme, b.at, b.end, agentRunning && !b.complete);
-		return chips ? `${chips} ${theme.fg("thinkingText", first)}` : first;
+		if (!chips) return first;
+		const styled = (t: string) => `${chips} ${theme.fg("thinkingText", t)}`;
+		return styled(capTail(first, MAX_LINE_CHARS - styled("").length));
 	};
 	for (const b of thinking.blocks) {
 		const lines = compactLines(b.lines);
@@ -486,6 +489,68 @@ class AnswerDivider implements Component {
 	}
 	invalidate(): void {}
 	dispose(): void {}
+}
+
+type NoticeType = "info" | "warning" | "error";
+
+/** An extension notification (`ctx.ui.notify`) in the response-only doc,
+ *  styled like pi's own status / warning / error lines in the transcript. */
+class NoticeLine implements Component {
+	constructor(
+		public text: string,
+		public readonly type: NoticeType,
+	) {}
+	render(width: number): string[] {
+		const text =
+			this.type === "error"
+				? `Error: ${this.text}`
+				: this.type === "warning"
+					? `Warning: ${this.text}`
+					: this.text;
+		const color = this.type === "info" ? "dim" : this.type;
+		const styled = docTheme ? docTheme.fg(color, text) : text;
+		return wrapTextWithAnsi(styled, Math.max(1, width - 2)).map((l) => " " + l);
+	}
+	invalidate(): void {}
+	dispose(): void {}
+}
+
+/** Last info notice in the doc: like pi's showStatus, back-to-back info
+ *  notices update it in place instead of stacking. */
+let lastInfoNotice: NoticeLine | null = null;
+
+/** Mirror an extension notification into the response doc (pi only draws
+ *  them into its own transcript, which panel C replaces). */
+function addResponseNotice(message: string, type: NoticeType | undefined): void {
+	const kind: NoticeType = type === "error" || type === "warning" ? type : "info";
+	const kids = responseDoc.children;
+	if (kind === "info" && lastInfoNotice && kids[kids.length - 1] === lastInfoNotice) {
+		lastInfoNotice.text = message;
+		return;
+	}
+	if (kids.length > 0) responseDoc.addChild(new Spacer(1));
+	const notice = new NoticeLine(message, kind);
+	responseDoc.addChild(notice);
+	lastInfoNotice = kind === "info" ? notice : null;
+}
+
+const NOTIFY_KEY = Symbol.for("pi-split-view.notify-mirror");
+
+/** Wrap the shared extension UI context's notify once; the wrapper calls
+ *  whatever mirror the current generation installed on globalThis, so a
+ *  reload never stacks wrappers. */
+function mirrorNotify(ui: any): void {
+	if (!ui || typeof ui.notify !== "function" || ui[NOTIFY_KEY]) return;
+	const original = ui.notify;
+	ui[NOTIFY_KEY] = true;
+	ui.notify = (message: string, type?: NoticeType) => {
+		original.call(ui, message, type);
+		try {
+			(globalThis as any)[NOTIFY_KEY]?.(message, type);
+		} catch {
+			/* mirroring is cosmetic; never break the caller */
+		}
+	};
 }
 
 /** Role of the last message actually added to the response doc. */
@@ -589,6 +654,7 @@ function rebuildResponseDoc(ctx: ExtensionContext): void {
 	responseDoc.clear();
 	streamingResponseComponent = null;
 	lastResponseRole = null;
+	lastInfoNotice = null;
 	const branch = ctx.sessionManager.getBranch();
 	for (const entry of branch) {
 		if (entry.type !== "message") continue;
@@ -1509,10 +1575,7 @@ class RecentBody {
 		const groups: { index: number; frags: string[] }[] = [];
 		let used = 0;
 		for (let i = src.length - 1; i >= 0; i--) {
-			const line =
-				src[i].length > MAX_LINE_CHARS
-					? "… " + src[i].slice(-MAX_LINE_CHARS + 1)
-					: src[i];
+			const line = capTail(src[i], MAX_LINE_CHARS);
 			const frags = wrapTextWithAnsi(
 				this.style(line),
 				Math.max(1, width - 3),
@@ -2548,6 +2611,12 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", (_e, ctx) => {
+		(globalThis as any)[NOTIFY_KEY] = (message: string, type?: NoticeType) => {
+			if (REG.gen !== MY_GEN) return;
+			addResponseNotice(message, type);
+			if (anyPanelActive()) requestRender();
+		};
+		if (ctx.mode === "tui") mirrorNotify(ctx.ui);
 		let cfg = normalizeConfig(loadUiPanelsConfig());
 		if (pi.getFlag("no-split")) {
 			// --no-split: start bare, ignoring the saved ui-panels.json defaults.
@@ -2594,7 +2663,6 @@ export default function (pi: ExtensionAPI) {
 							startupPending = false;
 							reconcileLayout(ctx.ui.theme);
 						}
-						if (cfg.split) ctx.ui.notify("Split view on", "info");
 					} else if (cfg.files) {
 						// Regular mode uses an overlay; filesOn is already the saved
 						// state, so clear it before calling the toggle.

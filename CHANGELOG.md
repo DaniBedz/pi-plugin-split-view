@@ -6,6 +6,8 @@ Notable changes to `pi-split-view`. Versioning is [SemVer](https://semver.org/).
 
 ### Added
 
+- Response-only view (panel C) now shows extension notifications (`ctx.ui.notify`,
+  e.g. the model router's pick), styled like pi's status/warning/error lines.
 - Time chips (`timestamps.ts`): thinking blocks, tool calls and conversation messages
   start with a posted-at pill; thinking blocks and tool calls add a step-duration pill
   (live while the step runs). Thinking durations, which pi doesn't persist, are logged as

@@ -55,6 +55,21 @@ export function timeChips(
 }
 
 const ANSI = /\x1b\[[0-9;:]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+
+/** Keep the last `max` chars of `s` (as `… tail`), never cutting inside an
+ * escape sequence: a cut mid-sequence prints its tail (`;43;43m`) as text. */
+export function capTail(s: string, max: number): string {
+	if (s.length <= max) return s;
+	let cut = s.length - Math.max(1, max - 2);
+	for (const m of s.matchAll(ANSI)) {
+		if (m.index >= cut) break;
+		if (m.index + m[0].length > cut) {
+			cut = m.index + m[0].length;
+			break;
+		}
+	}
+	return "… " + s.slice(cut);
+}
 const BG_SGR = /\x1b\[(?:[0-9;:]*;)?(?:4[0-8]|10[0-7])[;:m]/;
 
 /** A row with no text and no background colour, safe to draw a chip into. */
