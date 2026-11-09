@@ -598,9 +598,39 @@ function responseContent(msg: any): any[] {
 		);
 }
 
-/** Append a message to the response doc (user or assistant). */
+/** Answers the user gave a question tool (ask_user_question and similar),
+ *  read from the result's `details.answers`, as markdown; "" if none. */
+function questionAnswersText(msg: any): string {
+	const answers = msg?.details?.answers;
+	if (!Array.isArray(answers)) return "";
+	return answers
+		.map((a: any) => {
+			const answer =
+				typeof a?.answer === "string"
+					? a.answer
+					: Array.isArray(a?.selected)
+						? a.selected.join(", ")
+						: "";
+			if (!answer.trim()) return "";
+			return typeof a.question === "string" && a.question.trim()
+				? `*${a.question.trim()}*\n\n${answer}`
+				: answer;
+		})
+		.filter(Boolean)
+		.join("\n\n");
+}
+
+/** Append a message to the response doc (user, assistant, or the user's
+ *  answers to a question tool). */
 function addResponseMessage(msg: any): void {
 	try {
+		if (msg.role === "toolResult") {
+			const text = questionAnswersText(msg);
+			if (!text) return;
+			beginResponseEntry("user");
+			responseDoc.addChild(new UserMessageComponent(text, getMarkdownTheme()));
+			return;
+		}
 		if (msg.role === "user") {
 			const text = messageText(msg);
 			if (!text.trim()) return;
@@ -698,6 +728,7 @@ function responseMessageUpdate(msg: any): void {
 }
 
 function responseMessageEnd(msg: any): void {
+	if (msg?.role === "toolResult") return addResponseMessage(msg);
 	if (msg?.role !== "assistant") return;
 	if (streamingResponseComponent) {
 		try {

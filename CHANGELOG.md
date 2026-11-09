@@ -6,6 +6,8 @@ Notable changes to `pi-split-view`. Versioning is [SemVer](https://semver.org/).
 
 ### Added
 
+- Response-only view (panel C) now shows your answers to question tools
+  (`ask_user_question` and others that return `details.answers`) as user messages.
 - Response-only view (panel C) now shows extension notifications (`ctx.ui.notify`,
   e.g. the model router's pick), styled like pi's status/warning/error lines.
 - Time chips (`timestamps.ts`): thinking blocks, tool calls and conversation messages
