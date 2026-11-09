@@ -110,7 +110,7 @@ import {
 	type ToolMode as ToolModeCfg,
 } from "./ui-panels-config.ts";
 import { inHerdr, openInHerdrNvim } from "./herdr-nvim.ts";
-import { capTail, prefixChips, timeChips } from "./timestamps.ts";
+import { capTail, isPlainBlank, prefixChips, timeChips } from "./timestamps.ts";
 import {
 	getBaseRoot,
 	initLayoutManager,
@@ -1070,10 +1070,14 @@ function stampTranscript(c: any, lines: string[], width: number): string[] {
 		const chips = entryChips(theme, at, end, live);
 		if (visibleWidth(chips) + 2 > width) continue;
 		for (let row = top; row < y; row++) {
-			const stamped = prefixChips(out[row], chips, width, truncateToWidth, visibleWidth);
+			const stamped = prefixChips(out[row], chips, width, visibleWidth);
 			if (stamped === undefined) continue;
+			// A full first row would lose text: use the blank row above instead.
+			const above = stamped === null && row > 0 && isPlainBlank(out[row - 1]);
+			if (stamped === null && !above) break;
 			if (out === lines) out = lines.slice();
-			out[row] = stamped;
+			if (above) out[row - 1] = " " + chips;
+			else out[row] = stamped!;
 			break;
 		}
 	}

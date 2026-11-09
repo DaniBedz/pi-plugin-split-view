@@ -77,16 +77,16 @@ const TRAILING_PAD = /( +)((?:\x1b\[[0-9;:]*m)*)$/;
 /**
  * Put `chips` before the first visible character of a rendered row, as the
  * thinking panel does. The row's colours are re-applied after them (a chip
- * resets fg/bg) and the width comes out of its trailing padding, truncating
- * only when there isn't enough. undefined when the row has no text.
+ * resets fg/bg) and the width comes out of its trailing padding. undefined
+ * when the row has no text; null when the chips don't fit without cutting
+ * text off.
  */
 export function prefixChips(
 	line: string,
 	chips: string,
 	width: number,
-	truncate: (s: string, w: number) => string,
 	widthOf: (s: string) => number,
-): string | undefined {
+): string | null | undefined {
 	let i = 0;
 	while (i < line.length) {
 		ANSI_AT.lastIndex = i;
@@ -106,5 +106,13 @@ export function prefixChips(
 	// A chip's bg reset would show the terminal background on a tinted row.
 	const tinted = chips.replaceAll("\x1b[49m", "\x1b[49m" + active);
 	const out = body.slice(0, i) + tinted + active + " " + body.slice(i);
-	return widthOf(out) > width ? truncate(out, width) : out;
+	return widthOf(out) > width ? null : out;
+}
+
+const BG_SGR = /\x1b\[(?:[0-9;:]*;)?(?:4[0-8]|10[0-7])[;:m]/;
+
+/** A row with no text and no background colour, safe to draw a chip into. */
+export function isPlainBlank(line: string | undefined): boolean {
+	if (line === undefined) return false;
+	return line.replace(ANSI, "").trim() === "" && !BG_SGR.test(line);
 }
