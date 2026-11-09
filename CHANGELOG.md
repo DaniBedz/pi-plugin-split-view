@@ -11,8 +11,9 @@ Notable changes to `pi-split-view`. Versioning is [SemVer](https://semver.org/).
 - Response-only view (panel C) now shows extension notifications (`ctx.ui.notify`,
   e.g. the model router's pick), styled like pi's status/warning/error lines.
 - Time chips (`timestamps.ts`): thinking blocks, tool calls and conversation messages
-  start with a posted-at pill; thinking blocks and tool calls add a step-duration pill
-  (live while the step runs). Thinking durations, which pi doesn't persist, are logged as
+  start with a posted-at pill; thinking blocks, tool calls and answers add a step-duration
+  pill, and prompts a total-turn-time pill (live while running; answer and turn durations
+  come from session entry times on reload). Thinking durations, which pi doesn't persist, are logged as
   a hidden `split-view-thinking-times` custom session entry so they survive a reload. `/split-timestamps` toggles; new `timestamps` config key, saved by
   `/split-save`.
 - Double-click a line in the Edits panel (inside herdr, fullscreen mode) to open the file

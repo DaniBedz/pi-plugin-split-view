@@ -41,7 +41,7 @@ transcript mode — composed as one clean layout layer over pi's native transcri
   change the dock width, and the edge between the Thinking and Tool Usage panels to change
   their split. Sizes are saved to `ui-panels.json` when you let go.
 - **Time chips** — each thinking block, tool call, prompt and answer starts with a pill
-  showing when it was posted; thinking blocks and tool calls also get a pill with how
+  showing when it was posted; prompts get a pill with the whole turn's time, and thinking blocks, tool calls and answers a pill with how
   long that step took (counting up live while it runs). Thinking durations are kept in a
   hidden `split-view-thinking-times` entry in the session file, so they survive a reload. `/split-timestamps` toggles them; config key
   `timestamps` (default on).

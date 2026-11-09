@@ -967,6 +967,27 @@ function putUserTime(key: string, at: number): void {
 		userTimes.delete(userTimes.keys().next().value!);
 }
 
+/** Assistant message timestamp → when it finished (message_end; on reload,
+ * its session entry's timestamp, which pi writes at message_end). */
+const answerEnds = new Map<number, number>();
+/** Prompt time → when its turn ended (the next prompt or agent_end; on
+ * reload, the last message entry before the next prompt). */
+const turnEnds = new Map<number, number>();
+/** The prompt whose turn is still open (live duration chip). */
+let openTurn: number | undefined;
+
+function noteEnd(map: Map<number, number>, at: unknown, end: number): void {
+	if (typeof at !== "number" || !Number.isFinite(end)) return;
+	map.delete(at);
+	map.set(at, end);
+	if (map.size > MAX_USER_TIMES) map.delete(map.keys().next().value!);
+}
+
+function closeTurn(end: number): void {
+	if (openTurn !== undefined) noteEnd(turnEnds, openTurn, end);
+	openTurn = undefined;
+}
+
 /** Record a user message's time; returns it (undefined if not a user
  * message with text). */
 function noteUserTime(msg: any): number | undefined {
@@ -1023,14 +1044,20 @@ function stampTranscript(c: any, lines: string[], width: number): string[] {
 			if (shared) continue;
 			at = t;
 			row = top - 1;
+			end = at === undefined ? undefined : turnEnds.get(at);
+			live = agentRunning && end === undefined && at === openTurn;
 		} else if (k instanceof SkillInvocationMessageComponent) {
 			const content = (k as any).skillBlock?.content;
 			at = skillAt = userTimes.get(`\0skill\0${content}`);
 			row = top - 1;
+			end = at === undefined ? undefined : turnEnds.get(at);
+			live = agentRunning && end === undefined && at === openTurn;
 			skillAbove = true;
 		} else if (k instanceof AssistantMessageComponent) {
 			const ts = (k as any).lastMessage?.timestamp;
 			at = typeof ts === "number" ? ts : undefined;
+			end = at === undefined ? undefined : answerEnds.get(at);
+			live = agentRunning && end === undefined;
 		} else if (k instanceof ToolExecutionComponent) {
 			const t = toolTimes.get((k as any).toolCallId);
 			at = t?.at;
@@ -2562,11 +2589,20 @@ export default function (pi: ExtensionAPI) {
 		}
 		/** edit toolCallId → path, so persisted results get their file name. */
 		const editPaths = new Map<string, string>();
+		/** Entry time of the open turn's latest reply (its end so far). */
+		let turnLast: number | undefined;
+		openTurn = undefined;
 		for (const entry of branch) {
 			if (entry.type !== "message") continue;
 			const msg = (entry as any).message;
 			if (!msg) continue;
-			if (msg.role === "user") noteUserTime(msg);
+			const entryAt = Date.parse((entry as any).timestamp);
+			if (msg.role === "user") {
+				if (turnLast !== undefined) closeTurn(turnLast);
+				openTurn = noteUserTime(msg);
+				turnLast = undefined;
+			} else if (Number.isFinite(entryAt)) turnLast = entryAt;
+			if (msg.role === "assistant") noteEnd(answerEnds, msg.timestamp, entryAt);
 			const at = typeof msg.timestamp === "number" ? msg.timestamp : undefined;
 			if (msg.role === "assistant" && Array.isArray(msg.content)) {
 				const times = at === undefined ? undefined : thinkTimes.get(at);
@@ -2622,6 +2658,8 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 		}
+		if (turnLast !== undefined && !agentRunning) closeTurn(turnLast);
+		if (!agentRunning) openTurn = undefined;
 		if (thoughts.length) {
 			for (const t of thoughts) {
 				thinking.current = {
@@ -2733,7 +2771,11 @@ export default function (pi: ExtensionAPI) {
 		const msg = (event as any).message;
 		if (msg?.role === "assistant") pendingThinkTimes = {};
 		if (msg?.role === "user") {
-			noteUserTime(msg);
+			const at = noteUserTime(msg);
+			if (at !== undefined) {
+				closeTurn(Date.now());
+				openTurn = at;
+			}
 			addResponseMessage(msg);
 		}
 		if (anyPanelActive()) requestRender();
@@ -2760,6 +2802,7 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("agent_end", () => {
 		agentRunning = false;
+		closeTurn(Date.now());
 		stopChipTicker();
 		bumpChips();
 	});
@@ -2768,6 +2811,7 @@ export default function (pi: ExtensionAPI) {
 		// pi doesn't persist thinking durations: log them as a custom session
 		// entry (not sent to the model, not shown) so a rebuild can restore them.
 		if (msg?.role === "assistant") {
+			noteEnd(answerEnds, msg.timestamp, Date.now());
 			const blocks = pendingThinkTimes;
 			pendingThinkTimes = {};
 			if (typeof msg.timestamp === "number" && Object.keys(blocks).length) {
