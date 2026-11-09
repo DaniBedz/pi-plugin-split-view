@@ -110,7 +110,7 @@ import {
 	type ToolMode as ToolModeCfg,
 } from "./ui-panels-config.ts";
 import { inHerdr, openInHerdrNvim } from "./herdr-nvim.ts";
-import { capTail, isPlainBlank, timeChips } from "./timestamps.ts";
+import { capTail, prefixChips, timeChips } from "./timestamps.ts";
 import {
 	getBaseRoot,
 	initLayoutManager,
@@ -1008,16 +1008,21 @@ const STAMP_KEY = Symbol.for("pi-split-view.transcript-stamps");
 type Stamper = (c: any, lines: string[], width: number) => string[];
 
 /**
- * Draw time chips into a message container's rendered rows. Chips only go
- * into existing blank rows (the spacer above a user message, the blank first
- * row of an assistant message or tool call), so row counts and pi's mouse
- * hit-testing never change.
+ * Draw time chips in front of each message's first line of text, like the
+ * thinking panel. Rows are only edited in place, so row counts and pi's
+ * mouse hit-testing never change.
  */
 function stampTranscript(c: any, lines: string[], width: number): string[] {
 	if (!timestampsOn || REG.gen !== MY_GEN) return lines;
 	const theme = layoutTheme ?? docTheme;
-	const kids = c.mouseLayout?.width === width ? c.mouseLayout.children : null;
-	if (!theme || !Array.isArray(kids)) return lines;
+	if (!theme || !Array.isArray(c.children)) return lines;
+	// Builds without Container.mouseLayout (e.g. Pi-Bolt): measure children the
+	// way pi's handleMouse fallback does; their renders are width-cached.
+	const kids: { component: any; height: number }[] =
+		c.mouseLayout?.width === width
+			? c.mouseLayout.children
+			: c.children.map((k: any) => ({ component: k, height: k.render(width).length }));
+	if (kids.reduce((n, k) => n + k.height, 0) !== lines.length) return lines;
 	let out = lines;
 	let y = 0;
 	let skillAt: number | undefined;
@@ -1035,7 +1040,6 @@ function stampTranscript(c: any, lines: string[], width: number): string[] {
 		let at: number | undefined;
 		let end: number | undefined;
 		let live = false;
-		let row = top;
 		if (k instanceof UserMessageComponent) {
 			const t = userTimes.get((k as any).text);
 			// The text typed after a skill shares the skill's chips.
@@ -1043,13 +1047,11 @@ function stampTranscript(c: any, lines: string[], width: number): string[] {
 			skillAbove = false;
 			if (shared) continue;
 			at = t;
-			row = top - 1;
 			end = at === undefined ? undefined : turnEnds.get(at);
 			live = agentRunning && end === undefined && at === openTurn;
 		} else if (k instanceof SkillInvocationMessageComponent) {
 			const content = (k as any).skillBlock?.content;
 			at = skillAt = userTimes.get(`\0skill\0${content}`);
-			row = top - 1;
 			end = at === undefined ? undefined : turnEnds.get(at);
 			live = agentRunning && end === undefined && at === openTurn;
 			skillAbove = true;
@@ -1064,11 +1066,16 @@ function stampTranscript(c: any, lines: string[], width: number): string[] {
 			end = t?.end;
 			live = agentRunning;
 		} else continue;
-		if (at === undefined || row < 0 || !isPlainBlank(out[row])) continue;
-		const chips = " " + entryChips(theme, at, end, live);
-		if (visibleWidth(chips) > width) continue;
-		if (out === lines) out = lines.slice();
-		out[row] = chips;
+		if (at === undefined) continue;
+		const chips = entryChips(theme, at, end, live);
+		if (visibleWidth(chips) + 2 > width) continue;
+		for (let row = top; row < y; row++) {
+			const stamped = prefixChips(out[row], chips, width, truncateToWidth, visibleWidth);
+			if (stamped === undefined) continue;
+			if (out === lines) out = lines.slice();
+			out[row] = stamped;
+			break;
+		}
 	}
 	return out;
 }
