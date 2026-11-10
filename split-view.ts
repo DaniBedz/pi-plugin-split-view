@@ -544,6 +544,8 @@ function mirrorNotify(ui: any): void {
 	const original = ui.notify;
 	ui[NOTIFY_KEY] = true;
 	ui.notify = (message: string, type?: NoticeType) => {
+		// pi-claude-bridge repeats this at every 5% step; it's noise.
+		if (message.startsWith("Claude rate limit warning:")) return;
 		original.call(ui, message, type);
 		try {
 			(globalThis as any)[NOTIFY_KEY]?.(message, type);
