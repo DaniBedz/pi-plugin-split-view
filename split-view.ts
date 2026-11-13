@@ -2007,7 +2007,9 @@ function buildBand(theme: Theme, inner: Component): Component {
 			shrink: 1,
 			minSize: Math.min(6, bandHeight),
 		},
-		{ component: conversation, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+		// minSize keeps the editor dock on screen in short terminals (e.g. a
+		// half-height drop-down console): the band shrinks instead.
+		{ component: conversation, basis: 0, grow: 1, shrink: 1, minSize: 11 },
 	]);
 }
 
